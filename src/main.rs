@@ -419,6 +419,24 @@ impl App {
             let count = STATE.lock().unwrap().len();
             let (w, h) = window_size(count, dpi);
 
+            // When the ring count changes the window grows rightwards from its left edge;
+            // shift it left so it stays inside the monitor's work area.
+            let mut cur = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut cur);
+            let new_pos = if cur.right - cur.left != w {
+                let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                    let work = mi.rcWork;
+                    let x = cur.left.min(work.right - w - 16).max(work.left);
+                    Some(POINT { x, y: cur.top })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let screen = GetDC(None);
             let mem = CreateCompatibleDC(Some(screen));
             let bmi = BITMAPINFO {
@@ -454,7 +472,7 @@ impl App {
                         UpdateLayeredWindow(
                             hwnd,
                             Some(screen),
-                            None,
+                            new_pos.as_ref().map(|p| p as *const POINT),
                             Some(&size),
                             Some(mem),
                             Some(&src),
