@@ -106,12 +106,7 @@ Quit the widget from the tray before rebuilding, otherwise the exe is locked.
 
 ## Start with Windows
 
-```powershell
-$exe = "$PWD\target\release\claude-usage-widget.exe"
-Set-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run ClaudeUsageWidget "`"$exe`""
-```
-
-Remove with `Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run ClaudeUsageWidget`.
+Tray menu → **Run at Windows startup** (checked when enabled). It adds or removes a `ClaudeUsageWidget` entry under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, pointing at the current exe path.
 
 ## Updating
 
