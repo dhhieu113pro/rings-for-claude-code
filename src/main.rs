@@ -40,6 +40,44 @@ const ID_QUIT: usize = 4;
 const ID_MCP: usize = 5;
 const ID_PROFILES: usize = 6;
 const ID_UPDATE: usize = 7;
+const ID_STARTUP: usize = 8;
+
+const RUN_KEY: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const RUN_VALUE: windows::core::PCWSTR = w!("ClaudeUsageWidget");
+
+fn startup_enabled() -> bool {
+    use windows::Win32::System::Registry::*;
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, None, KEY_READ, &mut key).is_err() {
+            return false;
+        }
+        let r = RegQueryValueExW(key, RUN_VALUE, None, None, None, None);
+        let _ = RegCloseKey(key);
+        r.is_ok()
+    }
+}
+
+fn set_startup(enable: bool) {
+    use windows::Win32::System::Registry::*;
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, None, KEY_SET_VALUE, &mut key).is_err() {
+            return;
+        }
+        if enable {
+            if let Ok(exe) = std::env::current_exe() {
+                let cmd = format!("\"{}\"", exe.display());
+                let wide: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
+                let bytes = std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
+                let _ = RegSetValueExW(key, RUN_VALUE, None, REG_SZ, Some(bytes));
+            }
+        } else {
+            let _ = RegDeleteValueW(key, RUN_VALUE);
+        }
+        let _ = RegCloseKey(key);
+    }
+}
 
 // Layout, in DIPs.
 const PAD: f32 = 8.0;
@@ -533,6 +571,13 @@ fn show_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_STRING, ID_PROFILES, w!("Profiles"));
         let _ = AppendMenuW(menu, MF_STRING, ID_MCP, w!("MCP servers"));
         let _ = AppendMenuW(menu, MF_STRING, ID_CONFIG, w!("Settings"));
+        let startup = startup_enabled();
+        let _ = AppendMenuW(
+            menu,
+            if startup { MF_STRING | MF_CHECKED } else { MF_STRING },
+            ID_STARTUP,
+            w!("Run at Windows startup"),
+        );
         let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, w!("Check for updates"));
         let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, w!("Quit"));
 
@@ -558,6 +603,7 @@ fn show_menu(hwnd: HWND) {
             ID_PROFILES => open_page("/profiles"),
             ID_MCP => open_page("/mcp"),
             ID_CONFIG => open_page("/settings"),
+            ID_STARTUP => set_startup(!startup),
             ID_UPDATE => check_for_updates(hwnd),
             ID_QUIT => {
                 let _ = DestroyWindow(hwnd);
