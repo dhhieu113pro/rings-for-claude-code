@@ -114,15 +114,98 @@ fn percent_text(used: Option<f32>) -> String {
     used.map(|u| format!("{:.0}%", u.clamp(0.0, 100.0))).unwrap_or_else(|| "\u{2014}".into())
 }
 
+#[derive(Clone, PartialEq, Debug)]
+enum Dialog {
+    None,
+    New { name: String, servers: Vec<String> },
+    ConfirmRemove(String),
+    Created(String),
+}
+
+/// Profiles page state and actions, free of UI so tests can drive it directly.
+struct ProfilesModel {
+    state: ManagerState,
+    dialog: Dialog,
+    /// Inline error shown in the open dialog, or on the page when no dialog is open.
+    error: Option<String>,
+}
+
+impl ProfilesModel {
+    fn load() -> Self {
+        Self { state: manager::snapshot(), dialog: Dialog::None, error: None }
+    }
+
+    fn open_new(&mut self) {
+        self.error = None;
+        self.dialog = Dialog::New { name: String::new(), servers: Vec::new() };
+    }
+
+    fn set_name(&mut self, text: String) {
+        if let Dialog::New { name, .. } = &mut self.dialog {
+            *name = text;
+        }
+    }
+
+    fn pick_server(&mut self, server: &str, on: bool) {
+        if let Dialog::New { servers, .. } = &mut self.dialog {
+            servers.retain(|s| s != server);
+            if on {
+                servers.push(server.to_string());
+            }
+        }
+    }
+
+    /// Creates the profile; failures stay inline in the dialog and nothing else changes.
+    fn submit_new(&mut self) {
+        let Dialog::New { name, servers } = &self.dialog else { return };
+        match manager::new_profile(name, servers) {
+            Ok(made) => {
+                let mut text = format!("Profile folder: {}\nLauncher: {}", made.dir.display(), made.launcher.display());
+                for n in &made.notes {
+                    text += &format!("\n{n}");
+                }
+                self.error = None;
+                self.state = manager::snapshot();
+                self.dialog = Dialog::Created(text);
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn ask_remove(&mut self, name: String) {
+        self.error = None;
+        self.dialog = Dialog::ConfirmRemove(name);
+    }
+
+    /// Removes the entry from the config only; the profile's files are never touched.
+    fn confirm_remove(&mut self) {
+        let Dialog::ConfirmRemove(name) = &self.dialog else { return };
+        match manager::remove_profile(name) {
+            Ok(()) => self.state = manager::snapshot(),
+            Err(e) => self.error = Some(e),
+        }
+        self.dialog = Dialog::None;
+    }
+
+    fn dismiss(&mut self) {
+        self.dialog = Dialog::None;
+        self.error = None;
+    }
+}
+
 #[derive(Clone)]
 enum ProfilesMsg {
-    Reload,
-    Edit(String),
+    OpenNew,
+    Name(String),
+    PickServer(String, bool),
     Remove(String),
+    Edit(String),
+    /// Result of whichever dialog is open.
+    Closed(ContentDialogResult),
 }
 
 struct ProfilesPage {
-    state: ManagerState,
+    model: ProfilesModel,
 }
 
 impl Component for ProfilesPage {
@@ -130,24 +213,31 @@ impl Component for ProfilesPage {
     type Message = ProfilesMsg;
 
     fn create(_: &(), _: &ComponentContext<Self>) -> Self {
-        Self { state: manager::snapshot() }
+        Self { model: ProfilesModel::load() }
     }
 
     fn update(&mut self, message: ProfilesMsg, _: &ComponentContext<Self>) {
+        let m = &mut self.model;
         match message {
-            ProfilesMsg::Reload => self.state = manager::snapshot(),
-            // Dialogs arrive with the next step.
-            ProfilesMsg::Edit(_) | ProfilesMsg::Remove(_) => {}
+            ProfilesMsg::OpenNew => m.open_new(),
+            ProfilesMsg::Name(t) => m.set_name(t),
+            ProfilesMsg::PickServer(s, on) => m.pick_server(&s, on),
+            ProfilesMsg::Remove(n) => m.ask_remove(n),
+            ProfilesMsg::Edit(_) => {} // next step
+            ProfilesMsg::Closed(result) => {
+                let primary = result == ContentDialogResult::Primary;
+                match (&m.dialog, primary) {
+                    (Dialog::New { .. }, true) => m.submit_new(),
+                    (Dialog::ConfirmRemove(_), true) => m.confirm_remove(),
+                    _ => m.dismiss(),
+                }
+            }
         }
     }
 
     fn view(&self, _: &(), context: &mut ViewContext<Self>) -> View {
-        if self.state.profiles.is_empty() {
-            return StackPanel::new().spacing(8.0).children((
-                TextBlock::new().text("No profiles yet."),
-            ));
-        }
-        let cards: Vec<KeyedView> = self
+        let m = &self.model;
+        let cards: Vec<KeyedView> = m
             .state
             .profiles
             .iter()
@@ -173,7 +263,74 @@ impl Component for ProfilesPage {
                 KeyedView::new(p.name.clone(), card)
             })
             .collect();
-        StackPanel::new().spacing(12.0).keyed_children(cards)
+
+        let list: View = if cards.is_empty() {
+            TextBlock::new().text("No profiles yet.").into()
+        } else {
+            StackPanel::new().spacing(12.0).keyed_children(cards)
+        };
+        let page_error = if m.dialog == Dialog::None { m.error.clone().unwrap_or_default() } else { String::new() };
+
+        StackPanel::new().spacing(12.0).children((
+            Button::new().on_click(context.message(ProfilesMsg::OpenNew)).content("+ New profile"),
+            TextBlock::new().text(page_error),
+            list,
+            self.dialog_view(context),
+        ))
+    }
+}
+
+impl ProfilesPage {
+    fn dialog_view(&self, context: &mut ViewContext<Self>) -> View {
+        let m = &self.model;
+        let on_closed = context.callback(ProfilesMsg::Closed);
+        let error = m.error.clone().unwrap_or_default();
+        match &m.dialog {
+            Dialog::None => ContentDialog::new().is_open(false).title("").content(TextBlock::new()),
+            Dialog::New { name, servers } => {
+                let boxes: Vec<KeyedView> = m
+                    .state
+                    .servers
+                    .iter()
+                    .map(|s| {
+                        let n = s.name.clone();
+                        KeyedView::new(
+                            s.name.clone(),
+                            CheckBox::new()
+                                .is_checked(servers.contains(&s.name))
+                                .on_is_checked_changed(context.callback(move |on| ProfilesMsg::PickServer(n.clone(), on)))
+                                .content(s.name.clone()),
+                        )
+                    })
+                    .collect();
+                ContentDialog::new()
+                    .is_open(true)
+                    .title("New profile")
+                    .primary_button_text("Create")
+                    .close_button_text("Cancel")
+                    .on_closed(on_closed)
+                    .content(StackPanel::new().spacing(8.0).children((
+                        TextBox::new().text(name.clone()).placeholder_text("Name").on_text_changed(context.callback(ProfilesMsg::Name)),
+                        StackPanel::new().spacing(4.0).keyed_children(boxes),
+                        TextBlock::new().text(error),
+                    )))
+            }
+            Dialog::ConfirmRemove(name) => ContentDialog::new()
+                .is_open(true)
+                .title(format!("Remove \"{name}\"?"))
+                .primary_button_text("Remove")
+                .close_button_text("Cancel")
+                .on_closed(on_closed)
+                .content(TextBlock::new().text(
+                    "This removes the profile from the widget. Its folder and files are left untouched.",
+                )),
+            Dialog::Created(text) => ContentDialog::new()
+                .is_open(true)
+                .title("Profile created")
+                .close_button_text("OK")
+                .on_closed(on_closed)
+                .content(TextBlock::new().text(text.clone())),
+        }
     }
 }
 
@@ -275,6 +432,72 @@ mod tests {
     fn debug_escaped(s: &str) -> String {
         let d = format!("{s:?}");
         d[1..d.len() - 1].to_string()
+    }
+
+    #[test]
+    fn remove_confirms_then_keeps_files() {
+        let (_g, root) = env("remove", &["a", "b"]);
+        let mut m = ProfilesModel::load();
+        m.ask_remove("a".into());
+        assert_eq!(m.dialog, Dialog::ConfirmRemove("a".into()));
+        // Cancelling changes nothing.
+        m.dismiss();
+        assert_eq!(config::load().profiles.len(), 2);
+        m.ask_remove("a".into());
+        m.confirm_remove();
+        assert_eq!(m.dialog, Dialog::None);
+        let names: Vec<_> = config::load().profiles.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["b"]);
+        assert_eq!(m.state.profiles.len(), 1);
+        assert!(root.join("a").join(".claude.json").exists(), "profile files stay");
+        let out = render::<ProfilesPage>(());
+        assert!(!out.contains("\"a\""), "{out}");
+    }
+
+    #[test]
+    fn new_profile_errors_stay_inline_and_write_nothing() {
+        let (_g, _root) = env("newerr", &["a"]);
+        let mut m = ProfilesModel::load();
+        m.open_new();
+        m.set_name("../evil".into());
+        m.submit_new();
+        assert!(matches!(m.dialog, Dialog::New { .. }), "dialog stays open");
+        assert!(m.error.as_deref().unwrap_or("").contains("name may only use"), "{:?}", m.error);
+        assert_eq!(config::load().profiles.len(), 1);
+        m.dismiss();
+        assert!(m.error.is_none());
+    }
+
+    #[test]
+    fn new_profile_success_shows_paths_and_reloads() {
+        let (_g, root) = env("newok", &["a"]);
+        // Keep everything inside the temp root, with a stand-in for claude.exe.
+        let exe = root.join("claude.exe");
+        std::fs::write(&exe, "").unwrap();
+        std::env::set_var("CLAUDE_PROFILE_ROOT", root.join("profiles"));
+        std::env::set_var("CLAUDE_BIN_DIR", root.join("bin"));
+        std::env::set_var("CLAUDE_EXE", &exe);
+        let mut m = ProfilesModel::load();
+        m.open_new();
+        m.set_name("  work ".into());
+        m.pick_server("nope", true);
+        m.pick_server("nope", false);
+        m.submit_new();
+        match &m.dialog {
+            Dialog::Created(text) => assert!(text.contains("Profile folder:") && text.contains("Launcher:"), "{text}"),
+            other => panic!("expected Created, got {other:?} ({:?})", m.error),
+        }
+        assert!(m.state.profiles.iter().any(|p| p.name == "work"));
+    }
+
+    #[test]
+    fn dialogs_render() {
+        let (_g, _root) = env("dialogs", &["a"]);
+        let mut pump = Pump::new(RecordingRuntime::default());
+        pump.mount_view(View::component::<ProfilesPage>(())).unwrap();
+        pump.dispatch_components(16).unwrap();
+        let out = format!("{:?}", pump.runtime().commands());
+        assert!(out.contains("+ New profile") && out.contains("Remove"), "{out}");
     }
 
     #[test]
