@@ -45,3 +45,6 @@ features = [
 opt-level = "s"
 lto = true
 strip = true
+
+[dev-dependencies]
+windows-reactor = { version = "0.100", features = ["test"] }
