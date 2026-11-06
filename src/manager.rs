@@ -30,6 +30,51 @@ pub fn refresh_widget() {
     }
 }
 
+/// Manager window theme. `System` follows Windows' app mode and is the default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Theme {
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub fn arg(self) -> &'static str {
+        match self {
+            Theme::System => "system",
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::System => "System",
+            Theme::Light => "Light",
+            Theme::Dark => "Dark",
+        }
+    }
+    /// Unknown or missing values fall back to `System`.
+    pub fn parse(s: &str) -> Theme {
+        [Theme::Light, Theme::Dark].into_iter().find(|t| t.arg() == s).unwrap_or(Theme::System)
+    }
+    /// Whether the window should be dark, given what Windows currently prefers.
+    pub fn is_dark(self, system_dark: bool) -> bool {
+        match self {
+            Theme::System => system_dark,
+            Theme::Light => false,
+            Theme::Dark => true,
+        }
+    }
+}
+
+/// Saves the theme choice (fresh config, validated like every other save).
+pub fn save_theme(theme: Theme) -> Result<(), String> {
+    let mut cfg = config::load();
+    cfg.theme = theme.arg().to_string();
+    config::save(&config::normalize(cfg)?)?;
+    Ok(())
+}
+
 /// Ring colour by percent used: red above 90%, orange above 60%, otherwise green.
 /// The widget and the manager both use this, so the thresholds live in one place.
 pub fn level_rgb(used: f32) -> (f32, f32, f32) {
@@ -312,6 +357,7 @@ mod tests {
         fn config(&self, refresh: u64, profiles: &[(&str, Option<PathBuf>)]) {
             let cfg = config::Config {
                 refresh_seconds: refresh,
+                theme: "system".into(),
                 profiles: profiles
                     .iter()
                     .map(|(n, d)| config::ProfileConfig {
@@ -466,6 +512,28 @@ mod tests {
         let _env = Env::new("newprofile");
         let e = new_profile("../evil", &[]).err().unwrap();
         assert!(e.contains("name may only use"), "{e}");
+    }
+
+    #[test]
+    fn theme_defaults_to_system_and_round_trips() {
+        let env = Env::new("theme");
+        env.config(900, &[("a", None)]);
+        assert_eq!(Theme::parse(&config::load().theme), Theme::System);
+        for t in [Theme::Dark, Theme::Light, Theme::System] {
+            save_theme(t).unwrap();
+            assert_eq!(Theme::parse(&config::load().theme), t);
+        }
+        assert_eq!(config::load().profiles.len(), 1, "profiles untouched");
+        // An old config file without the key reads as system; a bad value is rejected on save.
+        let path = config::config_path();
+        std::fs::write(&path, r#"{"refresh_seconds":900,"profiles":[{"name":"a"}]}"#).unwrap();
+        assert_eq!(config::load().theme, "system");
+        let mut bad = config::load();
+        bad.theme = "purple".into();
+        assert!(config::normalize(bad).err().unwrap().contains("theme"));
+        assert_eq!(Theme::parse("purple"), Theme::System);
+        assert!(Theme::System.is_dark(true) && !Theme::System.is_dark(false));
+        assert!(Theme::Dark.is_dark(false) && !Theme::Light.is_dark(true));
     }
 
     #[test]

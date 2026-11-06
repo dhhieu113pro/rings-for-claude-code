@@ -2,7 +2,7 @@
 //! Native manager window. One process, one window: a second launch hands its page to the
 //! running instance (named mutex + event + `manager-nav.txt`) and exits.
 use claude_usage_widget::config;
-use claude_usage_widget::manager::{self, ManagerState, Page, ProfileCard};
+use claude_usage_widget::manager::{self, ManagerState, Page, ProfileCard, Theme};
 use std::path::PathBuf;
 use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, WAIT_OBJECT_0};
@@ -15,6 +15,127 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows_reactor::*;
 
 const TITLE: &str = "Usage Rings for Claude Code \u{2013} Manager";
+
+/// The app icon (dark disc, grey double ring, orange outer and green inner arc) as straight-alpha
+/// RGBA, drawn the same way as the widget's tray icon. 4x4 supersampling keeps the edges smooth.
+fn icon_rgba(size: u32) -> Vec<u8> {
+    let s = size as f32;
+    let (c, w) = (s / 2.0, s * 0.14);
+    let (r_out, r_in) = (s * 0.375, s * 0.2);
+    // Colour of one sample point, or None when it is outside the disc.
+    let sample = |x: f32, y: f32| -> Option<[f32; 3]> {
+        let (dx, dy) = (x - c, y - c);
+        let r = (dx * dx + dy * dy).sqrt();
+        if r > s / 2.0 {
+            return None;
+        }
+        let turn = dx.atan2(-dy).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+        let ring = |radius: f32| (r - radius).abs() <= w / 2.0;
+        Some(if ring(r_out) {
+            if turn <= 0.72 { [0.98, 0.58, 0.16] } else { [0.35, 0.37, 0.42] }
+        } else if ring(r_in) {
+            if turn <= 0.55 { [0.30, 0.78, 0.45] } else { [0.35, 0.37, 0.42] }
+        } else {
+            [0.08, 0.09, 0.11]
+        })
+    };
+    let mut out = Vec::with_capacity((size * size * 4) as usize);
+    for py in 0..size {
+        for px in 0..size {
+            let (mut rgb, mut hit) = ([0.0f32; 3], 0.0f32);
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let (x, y) = (px as f32 + (sx as f32 + 0.5) / 4.0, py as f32 + (sy as f32 + 0.5) / 4.0);
+                    if let Some(col) = sample(x, y) {
+                        hit += 1.0;
+                        for i in 0..3 {
+                            rgb[i] += col[i];
+                        }
+                    }
+                }
+            }
+            let a = hit / 16.0;
+            let div = hit.max(1.0);
+            out.extend([0, 1, 2].map(|i| (rgb[i] / div * 255.0).round() as u8));
+            out.push((a * 255.0).round() as u8);
+        }
+    }
+    out
+}
+
+/// Wraps the icon at several sizes in an .ico file (BMP/DIB entries, bottom-up BGRA + empty mask).
+fn ico_bytes(sizes: &[u32]) -> Vec<u8> {
+    let mut images: Vec<Vec<u8>> = Vec::new();
+    for &size in sizes {
+        let rgba = icon_rgba(size);
+        let mut img = Vec::new();
+        img.extend(40u32.to_le_bytes()); // BITMAPINFOHEADER
+        img.extend((size as i32).to_le_bytes());
+        img.extend((size as i32 * 2).to_le_bytes()); // colour + mask
+        img.extend(1u16.to_le_bytes());
+        img.extend(32u16.to_le_bytes());
+        img.extend([0u8; 24]);
+        for row in (0..size).rev() {
+            for col in 0..size {
+                let i = ((row * size + col) * 4) as usize;
+                img.extend([rgba[i + 2], rgba[i + 1], rgba[i], rgba[i + 3]]);
+            }
+        }
+        img.extend(vec![0u8; (size.div_ceil(32) * 4 * size) as usize]); // AND mask: all opaque
+        images.push(img);
+    }
+    let mut out = Vec::new();
+    out.extend([0u8, 0, 1, 0]);
+    out.extend((sizes.len() as u16).to_le_bytes());
+    let mut offset = 6 + 16 * sizes.len() as u32;
+    for (&size, img) in sizes.iter().zip(&images) {
+        out.extend([size as u8, size as u8, 0, 0]);
+        out.extend(1u16.to_le_bytes());
+        out.extend(32u16.to_le_bytes());
+        out.extend((img.len() as u32).to_le_bytes());
+        out.extend(offset.to_le_bytes());
+        offset += img.len() as u32;
+    }
+    for img in images {
+        out.extend(img);
+    }
+    out
+}
+
+/// Windows' "app mode" setting, read once at startup. The window's own colour-scheme callback is
+/// not used for this: the theme we set feeds back into it and flipped the page to light.
+fn system_prefers_dark() -> bool {
+    // Test hook: CLAUDE_MANAGER_THEME=light|dark overrides the system setting.
+    match std::env::var("CLAUDE_MANAGER_THEME").as_deref() {
+        Ok("light") => return false,
+        Ok("dark") => return true,
+        _ => {}
+    }
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    // Missing value (older Windows) means light.
+    status.is_ok() && value == 0
+}
+
+/// Writes the icon next to the config and returns its path for the window.
+fn window_icon_path() -> Option<&'static str> {
+    let path = config::config_path().with_file_name("manager.ico");
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    std::fs::write(&path, ico_bytes(&[16, 24, 32, 48, 64])).ok()?;
+    Some(Box::leak(path.to_string_lossy().into_owned().into_boxed_str()))
+}
 
 fn nav_file() -> PathBuf {
     config::config_path().with_file_name("manager-nav.txt")
@@ -31,10 +152,31 @@ enum ManagerMsg {
     Select(Page),
     /// Another launch asked this window to show a page.
     Widget(Page),
+    /// The sidebar was collapsed or expanded.
+    ToggleNav,
+    /// The theme button in the title bar: System, Light, Dark, System...
+    CycleTheme,
+    /// A selection event with nothing to act on.
+    Ignore,
+    /// The Settings page saved a new theme.
+    SetTheme(Theme),
 }
 
 struct ManagerRoot {
+    /// Saved choice; `System` follows `system_dark`.
+    theme: Theme,
+    system_dark: bool,
+    nav_open: bool,
+    /// When we last changed the page ourselves, to tell our own selection events from the user's.
+    programmatic_at: Option<std::time::Instant>,
+    icon: Option<&'static str>,
     page: Page,
+}
+
+impl ManagerRoot {
+    fn dark(&self) -> bool {
+        self.theme.is_dark(self.system_dark)
+    }
 }
 
 /// Blocks (in the background) until another launch signals; yields the requested page.
@@ -63,14 +205,42 @@ impl Component for ManagerRoot {
 
     fn create(input: &ManagerInput, context: &ComponentContext<Self>) -> Self {
         wait_for_navigation(context);
-        Self { page: input.first }
+        Self {
+            page: input.first,
+            theme: Theme::parse(&config::load().theme),
+            system_dark: system_prefers_dark(),
+            nav_open: true,
+            programmatic_at: None,
+            icon: window_icon_path(),
+        }
     }
 
     fn update(&mut self, message: ManagerMsg, context: &ComponentContext<Self>) {
         match message {
-            ManagerMsg::Select(p) => self.page = p,
+            ManagerMsg::Select(p) => {
+                // NavigationView also reports selection changes we caused ourselves (e.g. when a
+                // second launch switches page); those must not overwrite the requested page.
+                let ours = self.programmatic_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(600));
+                if !ours {
+                    self.page = p;
+                }
+            }
+            ManagerMsg::Ignore => {}
+            ManagerMsg::ToggleNav => self.nav_open = !self.nav_open,
+            ManagerMsg::CycleTheme => {
+                let next = match self.theme {
+                    Theme::System => Theme::Light,
+                    Theme::Light => Theme::Dark,
+                    Theme::Dark => Theme::System,
+                };
+                if manager::save_theme(next).is_ok() {
+                    self.theme = next;
+                }
+            }
+            ManagerMsg::SetTheme(t) => self.theme = t,
             ManagerMsg::Widget(p) => {
                 self.page = p;
+                self.programmatic_at = Some(std::time::Instant::now());
                 wait_for_navigation(context);
                 focus_window();
             }
@@ -79,40 +249,104 @@ impl Component for ManagerRoot {
 
     fn view(&self, _input: &ManagerInput, context: &mut ViewContext<Self>) -> View {
         context.window_title(TITLE);
-        let items = [Page::Profiles, Page::Mcp, Page::Settings].map(|p| {
-            KeyedView::new(
-                p.arg(),
-                NavigationViewItem::new()
-                    .tag(p.arg())
-                    .is_selected(p == self.page)
-                    .slot(NavigationViewItemSlot::Content, TextBlock::new().text(p.label())),
-            )
-        });
-        let content: View = match self.page {
-            Page::Profiles => View::component::<ProfilesPage>(()),
-            Page::Mcp => View::component::<McpPage>(()),
-            Page::Settings => View::component::<SettingsPage>(()),
+        // Mica makes the pane and title bar follow the theme. The content card has its own solid
+        // colour because the canvas rings cannot be transparent.
+        let mut visuals = WindowVisuals::new()
+            .backdrop(WindowBackdrop::Mica)
+            .theme(if self.dark() { WindowTheme::Dark } else { WindowTheme::Light })
+            .client_size(1000.0, 700.0);
+        if let Some(icon) = self.icon {
+            visuals = visuals.icon(icon);
+        }
+        context.window_visuals(visuals);
+        let icon_of = |p: Page| match p {
+            Page::Profiles => Symbol::People,
+            Page::Mcp => Symbol::Link,
+            Page::Settings => Symbol::Setting,
         };
-        let content: View = ScrollViewer::new().content(StackPanel::new().spacing(16.0).children((
-            TextBlock::new().text(self.page.label()).font_size(24.0),
-            content,
-        )));
-        NavigationView::new()
+        let items: Vec<KeyedView> = [Page::Profiles, Page::Mcp, Page::Settings]
+            .into_iter()
+            .map(|p| {
+                KeyedView::new(
+                    p.arg(),
+                    NavigationViewItem::new()
+                        .tag(p.arg())
+                        .is_selected(p == self.page)
+                        .slots([
+                            SlotView::new(NavigationViewItemSlot::Icon, SymbolIcon::new().symbol(icon_of(p))),
+                            SlotView::new(NavigationViewItemSlot::Content, TextBlock::new().text(p.label())),
+                        ]),
+                )
+            })
+            .collect();
+        let page: View = match self.page {
+            Page::Profiles => View::component::<ProfilesPage>(self.dark()),
+            Page::Mcp => View::component::<McpPage>(()),
+            Page::Settings => View::component::<SettingsPage>(SettingsInput {
+                on_theme: context.callback(ManagerMsg::SetTheme),
+                theme: self.theme,
+            }),
+        };
+        // An explicit page colour keeps the canvas rings seamless in every theme.
+        let g = page_gray(self.dark());
+        let content: View = ScrollViewer::new().content(
+            Grid::new().background(Color::rgb(g, g, g)).children((StackPanel::new()
+                .spacing(16.0)
+                .margin(Thickness::uniform(24.0))
+                .children((TextBlock::new().text(self.page.label()).font_size(24.0), page)),)),
+        );
+        // Same layout as the reactor gallery: an extended title bar (pane toggle, app name and
+        // current page, theme button) above a NavigationView.
+        let title_bar = TitleBar::new()
+            .title("Usage Rings for Claude Code")
+            .subtitle(self.page.label())
+            .is_back_button_visible(false)
+            .is_pane_toggle_button_visible(true)
+            .on_pane_toggle_requested(context.message(ManagerMsg::ToggleNav))
+            .slot(
+                TitleBarSlot::RightHeader,
+                Button::new()
+                    .on_click(context.message(ManagerMsg::CycleTheme))
+                    .content(format!("Theme: {}", self.theme.label())),
+            );
+        let nav = NavigationView::new()
             .pane_display_mode(NavigationViewPaneDisplayMode::Left)
+            .open_pane_length(240.0)
+            .pane_title("Usage Rings")
+            .is_pane_open(self.nav_open)
+            .is_pane_toggle_button_visible(false)
             .is_settings_visible(false)
             .is_back_button_visible(NavigationViewBackButtonVisible::Collapsed)
-            .on_selected_tag_changed(context.callback(|tag: Option<String>| {
-                ManagerMsg::Select(tag.and_then(|t| Page::parse(&t)).unwrap_or(Page::Profiles))
+            .on_selected_tag_changed(context.callback(|tag: Option<String>| match tag.and_then(|t| Page::parse(&t)) {
+                Some(p) => ManagerMsg::Select(p),
+                None => ManagerMsg::Ignore,
             }))
+            .grid_row(1)
             .slots([
                 SlotView::collection(NavigationViewSlot::MenuItems, items),
                 SlotView::new(NavigationViewSlot::Content, content),
-            ])
+            ]);
+        Grid::new().rows([GridLength::Auto, GridLength::STAR]).children((title_bar, nav))
     }
 }
 
 
 // ---------------------------------------------------------------- Profiles page
+
+/// A wrapped status/error line that takes no room while it is empty.
+fn note(text: String) -> View {
+    if text.is_empty() {
+        Grid::new().height(0.0).into()
+    } else {
+        TextBlock::new().text(text).text_wrapping(TextWrapping::Wrap).into()
+    }
+}
+
+/// Solid page colour per theme (#202020 / #F3F3F3). A canvas cannot be transparent, so the rings
+/// are cleared to this exact value to blend in.
+fn page_gray(dark: bool) -> u8 {
+    if dark { 0x20 } else { 0xF3 }
+}
 
 const RING_SIZE: f64 = 36.0;
 const RING_STROKE: f32 = 4.0;
@@ -130,10 +364,12 @@ fn arc_points(cx: f32, cy: f32, r: f32, fraction: f32) -> Vec<(f32, f32)> {
 }
 
 /// A ring showing a real reading, or only the empty track when there is none.
-fn ring_meter(used: Option<f32>) -> View {
+fn ring_meter(used: Option<f32>, dark: bool) -> View {
     let canvas = windows_canvas::canvas(move |dc| {
         let (cx, cy) = (dc.width / 2.0, dc.height / 2.0);
         let r = (dc.width.min(dc.height) - RING_STROKE) / 2.0;
+        let bg = page_gray(dark) as f32 / 255.0; // matches the page behind the canvas
+        dc.clear(windows_canvas::ColorF::new(bg, bg, bg, 1.0));
         let track = dc.create_solid_brush(windows_canvas::ColorF::new(0.5, 0.5, 0.5, 0.25))?;
         dc.draw_ellipse(&windows_canvas::Ellipse::new(windows_canvas::Vector2::new(cx, cy), r, r), &track, RING_STROKE);
         if let Some(u) = used.map(|u| u.clamp(0.0, 100.0)).filter(|u| *u > 0.0) {
@@ -343,10 +579,10 @@ struct ProfilesPage {
 }
 
 impl Component for ProfilesPage {
-    type Input = ();
+    type Input = bool; // dark theme
     type Message = ProfilesMsg;
 
-    fn create(_: &(), _: &ComponentContext<Self>) -> Self {
+    fn create(_: &bool, _: &ComponentContext<Self>) -> Self {
         Self { model: ProfilesModel::load() }
     }
 
@@ -373,7 +609,7 @@ impl Component for ProfilesPage {
         }
     }
 
-    fn view(&self, _: &(), context: &mut ViewContext<Self>) -> View {
+    fn view(&self, dark: &bool, context: &mut ViewContext<Self>) -> View {
         let m = &self.model;
         let cards: Vec<KeyedView> = m
             .state
@@ -391,12 +627,12 @@ impl Component for ProfilesPage {
                     TextBlock::new().text(p.name.clone()),
                     TextBlock::new().text(p.dir.clone()),
                     StackPanel::new().spacing(12.0).orientation(Orientation::Horizontal).children((
-                        ring_meter(p.session_used),
-                        ring_meter(p.weekly_used),
+                        ring_meter(p.session_used, *dark),
+                        ring_meter(p.weekly_used, *dark),
                         TextBlock::new().text(usage),
                     )),
-                    TextBlock::new().text(mcps),
-                    TextBlock::new().text(p.error.clone().unwrap_or_default()),
+                    TextBlock::new().text(mcps).max_width(680.0).horizontal_alignment(HorizontalAlignment::Left).text_wrapping(TextWrapping::WrapWholeWords),
+                    note(p.error.clone().unwrap_or_default()),
                     StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
                         Button::new().on_click(context.message(ProfilesMsg::Edit(p.name.clone()))).content("Edit"),
                         Button::new().on_click(context.message(ProfilesMsg::Remove(p.name.clone()))).content("Remove"),
@@ -415,10 +651,10 @@ impl Component for ProfilesPage {
 
         StackPanel::new().spacing(12.0).children((
             StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
-                Button::new().on_click(context.message(ProfilesMsg::OpenAdd)).content("Add existing{2026}"),
+                Button::new().on_click(context.message(ProfilesMsg::OpenAdd)).content("Add existing..."),
                 Button::new().on_click(context.message(ProfilesMsg::OpenNew)).content("+ New profile"),
             )),
-            TextBlock::new().text(page_error),
+            note(page_error),
             list,
             self.dialog_view(context),
         ))
@@ -457,7 +693,7 @@ impl ProfilesPage {
                     .content(StackPanel::new().spacing(8.0).children((
                         TextBox::new().text(name.clone()).placeholder_text("Name").on_text_changed(context.callback(ProfilesMsg::Name)),
                         StackPanel::new().spacing(4.0).keyed_children(boxes),
-                        TextBlock::new().text(error),
+                        note(error),
                     )))
             }
             Dialog::Edit { original, name, command, config_dir } => ContentDialog::new()
@@ -480,7 +716,7 @@ impl ProfilesPage {
                         .placeholder_text("Config folder (optional)")
                         .on_text_changed(context.callback(|t| ProfilesMsg::Field(EditField::ConfigDir, t))),
                     Button::new().on_click(context.message(ProfilesMsg::Browse)).content("Browse\u{2026}"),
-                    TextBlock::new().text(error),
+                    note(error),
                 ))),
             Dialog::ConfirmRemove(name) => ContentDialog::new()
                 .is_open(true)
@@ -760,7 +996,7 @@ impl Component for McpPage {
                     .collect();
                 let card = StackPanel::new().spacing(4.0).children((
                     TextBlock::new().text(format!("{}  [{}]", s.name, s.kind)),
-                    TextBlock::new().text(summary.clone()).tooltip(summary),
+                    TextBlock::new().text(summary.clone()).text_wrapping(TextWrapping::Wrap).tooltip(summary),
                     StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).keyed_children(boxes),
                     StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
                         Button::new().on_click(context.message(McpMsg::Edit(s.name.clone()))).content("Edit"),
@@ -794,8 +1030,8 @@ impl Component for McpPage {
                     .on_selection_changed(context.callback(McpMsg::ImportFrom)),
                 Button::new().on_click(context.message(McpMsg::Import)).content("Import"),
             )),
-            TextBlock::new().text(m.notice.clone().unwrap_or_default()),
-            TextBlock::new().text(page_error),
+            note(m.notice.clone().unwrap_or_default()),
+            note(page_error),
             list,
             StackPanel::new().spacing(4.0).keyed_children(warnings),
             self.dialog_view(context),
@@ -851,7 +1087,7 @@ impl McpPage {
                             TextBlock::new().text(format!("Type: {}", f.kind)),
                         )),
                         fields,
-                        TextBlock::new().text(error),
+                        note(error),
                     )))
             }
         }
@@ -865,11 +1101,13 @@ struct SettingsModel {
     seconds: String,
     error: Option<String>,
     saved: bool,
+    theme: Theme,
 }
 
 impl SettingsModel {
     fn load() -> Self {
-        Self { seconds: config::load().refresh_seconds.to_string(), error: None, saved: false }
+        let cfg = config::load();
+        Self { seconds: cfg.refresh_seconds.to_string(), error: None, saved: false, theme: Theme::parse(&cfg.theme) }
     }
 
     fn set_seconds(&mut self, text: String) {
@@ -897,39 +1135,95 @@ impl SettingsModel {
 enum SettingsMsg {
     Seconds(String),
     Save,
+    Theme(Theme),
+}
+
+/// What the page needs from the window: a way to tell it the theme changed.
+#[derive(Clone, PartialEq)]
+struct SettingsInput {
+    on_theme: Callback<Theme>,
+    /// The window's current theme, so the page shows the same choice when it changes elsewhere.
+    theme: Theme,
 }
 
 struct SettingsPage {
     model: SettingsModel,
 }
 
+impl SettingsModel {
+    /// Saves right away (no Save button for the theme); returns whether it was stored.
+    fn choose_theme(&mut self, theme: Theme) -> bool {
+        self.saved = false;
+        match manager::save_theme(theme) {
+            Ok(()) => {
+                self.theme = theme;
+                self.error = None;
+                true
+            }
+            Err(e) => {
+                self.error = Some(e);
+                false
+            }
+        }
+    }
+}
+
 impl Component for SettingsPage {
-    type Input = ();
+    type Input = SettingsInput;
     type Message = SettingsMsg;
 
-    fn create(_: &(), _: &ComponentContext<Self>) -> Self {
+    fn create(_: &SettingsInput, _: &ComponentContext<Self>) -> Self {
         Self { model: SettingsModel::load() }
     }
+    fn input_changed(&mut self, input: &SettingsInput, _: &ComponentContext<Self>) {
+        self.model.theme = input.theme;
+    }
+
 
     fn update(&mut self, message: SettingsMsg, _: &ComponentContext<Self>) {
         match message {
             SettingsMsg::Seconds(t) => self.model.set_seconds(t),
             SettingsMsg::Save => self.model.save(),
+            SettingsMsg::Theme(t) => {
+                self.model.choose_theme(t);
+            }
         }
     }
 
-    fn view(&self, _: &(), context: &mut ViewContext<Self>) -> View {
+    fn view(&self, input: &SettingsInput, context: &mut ViewContext<Self>) -> View {
         let m = &self.model;
         let status = match (&m.error, m.saved) {
             (Some(e), _) => e.clone(),
             (None, true) => "Saved.".to_string(),
             _ => String::new(),
         };
+        let themes: Vec<KeyedView> = [Theme::System, Theme::Light, Theme::Dark]
+            .into_iter()
+            .map(|t| {
+                let on_theme = input.on_theme.clone();
+                let sender = context.sender();
+                KeyedView::new(
+                    t.arg(),
+                    Button::new()
+                        .style(if t == m.theme { ButtonStyle::Accent } else { ButtonStyle::Default })
+                        .on_click(Callback::new(move |_: ()| {
+                            // Save through the page, then let the window re-theme itself.
+                            if manager::save_theme(t).is_ok() {
+                                let _ = on_theme.call(t);
+                            }
+                            sender.send(SettingsMsg::Theme(t));
+                        }))
+                        .content(t.label()),
+                )
+            })
+            .collect();
         StackPanel::new().spacing(8.0).children((
+            TextBlock::new().text("Theme"),
+            StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).keyed_children(themes),
             TextBlock::new().text("Refresh interval (seconds)"),
-            TextBox::new().text(m.seconds.clone()).on_text_changed(context.callback(SettingsMsg::Seconds)),
+            TextBox::new().text(m.seconds.clone()).max_width(240.0).horizontal_alignment(HorizontalAlignment::Left).on_text_changed(context.callback(SettingsMsg::Seconds)),
             Button::new().on_click(context.message(SettingsMsg::Save)).content("Save"),
-            TextBlock::new().text(status),
+            note(status),
         ))
     }
 }
@@ -1004,6 +1298,7 @@ mod tests {
         std::env::set_var("APPDATA", root.join("appdata"));
         let cfg = config::Config {
             refresh_seconds: 900,
+            theme: "system".into(),
             profiles: profiles
                 .iter()
                 .map(|n| {
@@ -1052,7 +1347,7 @@ mod tests {
         assert_eq!(names, ["b"]);
         assert_eq!(m.state.profiles.len(), 1);
         assert!(root.join("a").join(".claude.json").exists(), "profile files stay");
-        let out = render::<ProfilesPage>(());
+        let out = render::<ProfilesPage>(true);
         assert!(!out.contains("\"a\""), "{out}");
     }
 
@@ -1154,7 +1449,7 @@ mod tests {
     fn dialogs_render() {
         let (_g, _root) = env("dialogs", &["a"]);
         let mut pump = Pump::new(RecordingRuntime::default());
-        pump.mount_view(View::component::<ProfilesPage>(())).unwrap();
+        pump.mount_view(View::component::<ProfilesPage>(true)).unwrap();
         pump.dispatch_components(16).unwrap();
         let out = format!("{:?}", pump.runtime().commands());
         assert!(out.contains("+ New profile") && out.contains("Remove"), "{out}");
@@ -1285,7 +1580,75 @@ mod tests {
         m.save();
         assert!(m.saved && m.error.is_none());
         assert_eq!(config::load().refresh_seconds, 42);
-        assert!(render::<SettingsPage>(()).contains("Refresh interval (seconds)"));
+        assert!(render::<SettingsPage>(SettingsInput { on_theme: Callback::new(|_| {}), theme: Theme::System }).contains("Refresh interval (seconds)"));
+    }
+
+    #[test]
+    fn theme_defaults_to_system_and_choice_is_saved() {
+        let (_g, _root) = env("themeui", &["a"]);
+        let mut m = SettingsModel::load();
+        assert_eq!(m.theme, Theme::System, "default is system");
+        assert!(m.choose_theme(Theme::Dark));
+        assert_eq!(m.theme, Theme::Dark);
+        assert_eq!(config::load().theme, "dark");
+        assert_eq!(SettingsModel::load().theme, Theme::Dark, "reopening shows the saved choice");
+        assert!(m.choose_theme(Theme::System));
+        assert_eq!(config::load().theme, "system");
+        assert!(render::<SettingsPage>(SettingsInput { on_theme: Callback::new(|_| {}), theme: Theme::System }).contains("Theme"));
+    }
+
+    #[test]
+    fn window_follows_the_saved_theme_and_system_setting() {
+        let (_g, _root) = env("themewin", &["a"]);
+        // System follows Windows; an explicit choice wins over it.
+        let root = |theme, system_dark| ManagerRoot {
+            theme,
+            system_dark,
+            nav_open: true,
+            programmatic_at: None,
+            icon: None,
+            page: Page::Profiles,
+        };
+        assert!(root(Theme::System, true).dark() && !root(Theme::System, false).dark());
+        assert!(root(Theme::Dark, false).dark() && !root(Theme::Light, true).dark());
+    }
+
+    #[test]
+    fn icon_matches_the_tray_artwork() {
+        let px = |rgba: &[u8], size: u32, x: u32, y: u32| {
+            let i = ((y * size + x) * 4) as usize;
+            [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+        };
+        let img = icon_rgba(64);
+        assert_eq!(img.len(), 64 * 64 * 4);
+        assert_eq!(px(&img, 64, 0, 0)[3], 0, "corner outside the disc is transparent");
+        let centre = px(&img, 64, 32, 32);
+        assert_eq!(centre[3], 255);
+        assert!(centre[0] < 40, "dark disc: {centre:?}");
+        // Just right of 12 o'clock on the outer ring (radius 24, x = 34): orange arc.
+        let orange = px(&img, 64, 34, 8);
+        assert!(orange[0] > 200 && orange[1] > 120 && orange[2] < 100, "{orange:?}");
+        // Just right of 12 o'clock on the inner ring (radius 12.8): green arc.
+        let green = px(&img, 64, 34, 19);
+        assert!(green[1] > 150 && green[0] < 100, "{green:?}");
+    }
+
+    #[test]
+    fn ico_file_is_well_formed() {
+        let ico = ico_bytes(&[16, 32]);
+        assert_eq!(&ico[..6], &[0, 0, 1, 0, 2, 0]);
+        let entry = |n: usize| {
+            let e = &ico[6 + 16 * n..6 + 16 * (n + 1)];
+            (e[0], u32::from_le_bytes(e[8..12].try_into().unwrap()), u32::from_le_bytes(e[12..16].try_into().unwrap()))
+        };
+        let (w0, len0, off0) = entry(0);
+        let (w1, len1, off1) = entry(1);
+        assert_eq!((w0, w1), (16, 32));
+        assert_eq!(off0, 6 + 32);
+        assert_eq!(off1, off0 + len0);
+        assert_eq!(ico.len() as u32, off1 + len1);
+        // 40-byte header + 16x16x4 colour + 16 rows x 4-byte mask rows
+        assert_eq!(len0, 40 + 16 * 16 * 4 + 16 * 4);
     }
 
     #[test]
@@ -1301,7 +1664,7 @@ mod tests {
     #[test]
     fn profiles_empty_state() {
         let (_g, _root) = env("empty", &[]);
-        let out = render::<ProfilesPage>(());
+        let out = render::<ProfilesPage>(true);
         assert!(out.contains("No profiles yet."), "{out}");
     }
 
@@ -1316,7 +1679,7 @@ mod tests {
             error: None,
         }])
         .unwrap();
-        let out = render::<ProfilesPage>(());
+        let out = render::<ProfilesPage>(true);
         assert!(out.contains("Session 42%"), "{out}");
         assert!(out.contains("(resets Nov 12)"), "{out}");
         // No reading for b: dashes, never an invented percent.
@@ -1329,7 +1692,7 @@ mod tests {
     fn unreadable_profile_shows_error_card() {
         let (_g, root) = env("broken", &["a"]);
         std::fs::write(root.join("a").join(".claude.json"), "{ not json").unwrap();
-        let out = render::<ProfilesPage>(());
+        let out = render::<ProfilesPage>(true);
         assert!(out.contains("a"), "{out}");
         let card = manager::snapshot().profiles.remove(0);
         let err = card.error.expect("snapshot reports the read error");

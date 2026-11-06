@@ -52,7 +52,7 @@ Claude Code handles authentication and token refresh itself, so the widget never
 The tray menu opens the native manager window (`claude-usage-manager.exe`, next to the widget) with three pages: **Profiles**, **MCP servers** and **Settings**. Clicking a tray item while the window is open switches it to that page.
 
 - **Profiles** lists the profiles shown in the widget with their folder, launcher command and enabled MCP servers. Edit changes the name, launcher command or config folder; Remove only hides a profile in the widget (its files are kept); *Add existing…* shows an existing config folder; *New profile* creates one (see below).
-- **Settings** sets the refresh interval.
+- **Settings** sets the refresh interval and the manager theme (System, Light or Dark; System follows the Windows app mode and is the default). The title bar has a theme button too, and the menu button there collapses the sidebar to icons.
 
 Saving applies immediately and triggers a refresh.
 
@@ -61,6 +61,7 @@ The settings are stored in `%APPDATA%\claude-usage-widget\config.json`, created 
 ```json
 {
   "refresh_seconds": 900,
+  "theme": "system",
   "profiles": [
     { "name": "main", "command": "claude" }
   ]
@@ -72,6 +73,7 @@ The settings are stored in `%APPDATA%\claude-usage-widget\config.json`, created 
 | `name` | Label shown under the rings |
 | `command` | Launcher command. Its `.cmd`/`.bat` on `PATH` is parsed for `CLAUDE_CONFIG_DIR`; without one, `~/.claude` is used |
 | `config_dir` | Explicit config directory (`~` expanded). Takes priority over `command` |
+| `theme` | Manager window theme: `system` (default), `light` or `dark` |
 | `refresh_seconds` | Poll interval in seconds, default 900 (15 min), minimum 15. "Refresh now" and restarting the app each make an immediate request, so avoid spamming them |
 
 Profile launchers look like this (`claude-work.cmd`):
