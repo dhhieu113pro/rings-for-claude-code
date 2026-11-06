@@ -120,6 +120,31 @@ enum Dialog {
     New { name: String, servers: Vec<String> },
     ConfirmRemove(String),
     Created(String),
+    Edit { original: String, name: String, command: String, config_dir: String },
+}
+
+/// Which field of the edit dialog changed.
+#[derive(Clone, Copy)]
+enum EditField {
+    Name,
+    Command,
+    ConfigDir,
+}
+
+/// Native folder picker; `None` on cancel or error. Runs on the XAML (STA) thread.
+fn pick_folder() -> Option<String> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog.SetOptions(options | FOS_PICKFOLDERS).ok()?;
+        dialog.Show(None).ok()?;
+        let path = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let text = path.to_string().ok();
+        CoTaskMemFree(Some(path.0 as *const _));
+        text
+    }
 }
 
 /// Profiles page state and actions, free of UI so tests can drive it directly.
@@ -187,6 +212,51 @@ impl ProfilesModel {
         self.dialog = Dialog::None;
     }
 
+    /// Pre-fills from the config entry itself (the card shows the resolved folder, not the setting).
+    fn open_edit(&mut self, name: &str) {
+        self.error = None;
+        if let Some(p) = config::load().profiles.into_iter().find(|p| p.name == name) {
+            self.dialog = Dialog::Edit {
+                original: p.name.clone(),
+                name: p.name,
+                command: p.command.unwrap_or_default(),
+                config_dir: p.config_dir.unwrap_or_default(),
+            };
+        } else {
+            self.error = Some("unknown profile".into());
+        }
+    }
+
+    fn set_field(&mut self, field: EditField, text: String) {
+        if let Dialog::Edit { name, command, config_dir, .. } = &mut self.dialog {
+            match field {
+                EditField::Name => *name = text,
+                EditField::Command => *command = text,
+                EditField::ConfigDir => *config_dir = text,
+            }
+        }
+    }
+
+    fn picked_folder(&mut self, folder: Option<String>) {
+        if let Some(f) = folder {
+            self.set_field(EditField::ConfigDir, f);
+        }
+    }
+
+    /// Blank command/folder mean "default"; errors stay inline and nothing is written.
+    fn submit_edit(&mut self) {
+        let Dialog::Edit { original, name, command, config_dir } = &self.dialog else { return };
+        let opt = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
+        match manager::edit_profile(original, name.trim(), opt(command), opt(config_dir)) {
+            Ok(()) => {
+                self.state = manager::snapshot();
+                self.dialog = Dialog::None;
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
     fn dismiss(&mut self) {
         self.dialog = Dialog::None;
         self.error = None;
@@ -200,6 +270,8 @@ enum ProfilesMsg {
     PickServer(String, bool),
     Remove(String),
     Edit(String),
+    Field(EditField, String),
+    Browse,
     /// Result of whichever dialog is open.
     Closed(ContentDialogResult),
 }
@@ -223,12 +295,15 @@ impl Component for ProfilesPage {
             ProfilesMsg::Name(t) => m.set_name(t),
             ProfilesMsg::PickServer(s, on) => m.pick_server(&s, on),
             ProfilesMsg::Remove(n) => m.ask_remove(n),
-            ProfilesMsg::Edit(_) => {} // next step
+            ProfilesMsg::Edit(n) => m.open_edit(&n),
+            ProfilesMsg::Field(f, t) => m.set_field(f, t),
+            ProfilesMsg::Browse => m.picked_folder(pick_folder()),
             ProfilesMsg::Closed(result) => {
                 let primary = result == ContentDialogResult::Primary;
                 match (&m.dialog, primary) {
                     (Dialog::New { .. }, true) => m.submit_new(),
                     (Dialog::ConfirmRemove(_), true) => m.confirm_remove(),
+                    (Dialog::Edit { .. }, true) => m.submit_edit(),
                     _ => m.dismiss(),
                 }
             }
@@ -315,6 +390,28 @@ impl ProfilesPage {
                         TextBlock::new().text(error),
                     )))
             }
+            Dialog::Edit { name, command, config_dir, .. } => ContentDialog::new()
+                .is_open(true)
+                .title("Edit profile")
+                .primary_button_text("Save")
+                .close_button_text("Cancel")
+                .on_closed(on_closed)
+                .content(StackPanel::new().spacing(8.0).children((
+                    TextBox::new()
+                        .text(name.clone())
+                        .placeholder_text("Name")
+                        .on_text_changed(context.callback(|t| ProfilesMsg::Field(EditField::Name, t))),
+                    TextBox::new()
+                        .text(command.clone())
+                        .placeholder_text("Command (optional)")
+                        .on_text_changed(context.callback(|t| ProfilesMsg::Field(EditField::Command, t))),
+                    TextBox::new()
+                        .text(config_dir.clone())
+                        .placeholder_text("Config folder (optional)")
+                        .on_text_changed(context.callback(|t| ProfilesMsg::Field(EditField::ConfigDir, t))),
+                    Button::new().on_click(context.message(ProfilesMsg::Browse)).content("Browse\u{2026}"),
+                    TextBlock::new().text(error),
+                ))),
             Dialog::ConfirmRemove(name) => ContentDialog::new()
                 .is_open(true)
                 .title(format!("Remove \"{name}\"?"))
@@ -452,6 +549,48 @@ mod tests {
         assert!(root.join("a").join(".claude.json").exists(), "profile files stay");
         let out = render::<ProfilesPage>(());
         assert!(!out.contains("\"a\""), "{out}");
+    }
+
+    #[test]
+    fn edit_saves_prefills_and_keeps_others() {
+        let (_g, root) = env("edit", &["a", "b"]);
+        let mut m = ProfilesModel::load();
+        m.open_edit("a");
+        match &m.dialog {
+            Dialog::Edit { name, config_dir, command, .. } => {
+                assert_eq!(name, "a");
+                assert_eq!(config_dir, &root.join("a").display().to_string());
+                assert_eq!(command, "");
+            }
+            other => panic!("{other:?}"),
+        }
+        m.set_field(EditField::Name, " a2 ".into());
+        m.set_field(EditField::Command, "claude-x".into());
+        m.picked_folder(None); // cancelled picker changes nothing
+        m.picked_folder(Some("D:\\other".into()));
+        m.submit_edit();
+        assert_eq!(m.dialog, Dialog::None, "{:?}", m.error);
+        let cfg = config::load();
+        assert_eq!(cfg.profiles[0].name, "a2");
+        assert_eq!(cfg.profiles[0].command.as_deref(), Some("claude-x"));
+        assert_eq!(cfg.profiles[0].config_dir.as_deref(), Some("D:\\other"));
+        assert_eq!(cfg.profiles[1].name, "b");
+        assert_eq!(m.state.profiles[0].name, "a2");
+    }
+
+    #[test]
+    fn edit_errors_stay_inline_and_write_nothing() {
+        let (_g, _root) = env("editerr", &["a", "b"]);
+        let mut m = ProfilesModel::load();
+        m.open_edit("a");
+        m.set_field(EditField::Name, "b".into());
+        m.submit_edit();
+        assert!(matches!(m.dialog, Dialog::Edit { .. }));
+        assert!(m.error.as_deref().unwrap_or("").contains("appears twice"), "{:?}", m.error);
+        assert_eq!(config::load().profiles[0].name, "a");
+        m.dismiss();
+        m.open_edit("nope");
+        assert_eq!(m.error.as_deref(), Some("unknown profile"));
     }
 
     #[test]
