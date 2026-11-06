@@ -24,7 +24,7 @@ Ring colour is based on percent used, per ring:
 
 - Any number of profiles, laid out in a compact grid of 2 rows
 - Transparent, always-on-top and click-through: mouse clicks go to the apps underneath
-- Tray icon menu: **Refresh now**, **Unlock to move** (drag the widget), **Profiles**, **MCP servers**, **Settings**, **Quit**
+- Tray icon menu: **Refresh now**, **Unlock to move** (drag the widget), **Dashboard** (opens the manager), **Run at Windows startup**, **Quit**. Only one widget and one manager run at a time; starting a second widget just flashes the rings of the running one
 - Per-monitor DPI aware; starts bottom-right of the work area
 - Draws its own tray icon at startup (dark disc with an orange and green double ring); if it is hidden, drag it out of the tray overflow
 - Refreshes every 15 minutes by default; the old numbers stay visible while a refresh runs
@@ -49,10 +49,11 @@ Claude Code handles authentication and token refresh itself, so the widget never
 
 ## Configuration
 
-The tray menu opens the native manager window (`claude-usage-manager.exe`, next to the widget) with three pages: **Profiles**, **MCP servers** and **Settings**. Clicking a tray item while the window is open switches it to that page.
+The tray menu's **Dashboard** opens the native manager window (`claude-usage-manager.exe`, next to the widget), centred on the screen, with four pages: **Home** (dashboard), **Profiles**, **MCP servers** and **Settings**. Starting the manager again while it is open just brings that window forward. The title bar has a **Show rings** button that raises the rings widget (and starts it if it is not running).
 
+- **Home** shows the number of accounts, the highest weekly use, the next weekly reset, a donut of each account's share of the combined weekly usage, and the upcoming reset dates (plus any account whose usage could not be read).
 - **Profiles** lists the profiles shown in the widget with their folder, launcher command and enabled MCP servers. Edit changes the name, launcher command or config folder; Remove only hides a profile in the widget (its files are kept); *Add existing…* shows an existing config folder; *New profile* creates one (see below).
-- **Settings** sets the refresh interval and the manager theme (System, Light or Dark; System follows the Windows app mode and is the default). The title bar has a theme button too, and the menu button there collapses the sidebar to icons.
+- **Settings** sets the manager theme (System, Light or Dark; System follows the Windows app mode and is the default), the refresh interval, and checks for updates. The interval is saved when you leave the page or close the window. The menu button in the title bar collapses the sidebar to icons.
 
 Saving applies immediately and triggers a refresh.
 
@@ -111,7 +112,7 @@ Tray menu → **Run at Windows startup** (checked when enabled). It adds or remo
 
 ## Updating
 
-Tray menu → **Check for updates**. If a newer GitHub release exists, you are asked to confirm; the app then downloads the zip for your architecture, verifies it against the release's `.sha256` file, closes, replaces its exe and starts the new version. If the download or checksum fails, nothing is changed. It uses the `curl`, `tar` and PowerShell that ship with Windows 10/11.
+Manager → **Settings → Check for updates**. If a newer GitHub release exists, you are asked to confirm; the app then downloads the zip for your architecture, verifies it against the release's `.sha256` file, closes, replaces both exes (widget and manager) and starts the new version. If the download or checksum fails, nothing is changed. It uses the `curl`, `tar` and PowerShell that ship with Windows 10/11.
 
 ## Troubleshooting
 

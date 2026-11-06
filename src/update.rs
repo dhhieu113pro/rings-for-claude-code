@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 
 pub const REPO: &str = "dhhieu113pro/rings-for-claude-code";
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Release {
     pub tag: String,
     pub zip_url: String,
@@ -229,6 +229,7 @@ $manager = Join-Path (Split-Path $Target) 'claude-usage-manager.exe'
 $pairs = @(@($Target, $NewExe), @($manager, $NewManager))
 Wait-Process -Id $ProcId -Timeout 30 -ErrorAction SilentlyContinue
 Stop-Process -Name 'claude-usage-manager' -Force -ErrorAction SilentlyContinue
+Stop-Process -Name 'claude-usage-widget' -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
 $done = @()
 try {
@@ -258,10 +259,18 @@ try {
 "#
 }
 
-/// Starts the hidden helper that waits for this process to exit, swaps the exe and relaunches.
+/// The widget exe in the folder of the running executable (the widget or the manager).
+pub fn installed_widget_exe() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    Ok(exe.with_file_name("claude-usage-widget.exe"))
+}
+
+/// Starts the hidden helper that waits for this process to exit, stops the widget and manager,
+/// swaps both exes and relaunches the widget. Works from either executable: the target is always
+/// the installed widget exe next to the one running.
 /// The caller must exit right after this returns Ok.
 pub fn start_replace_helper(ready: &Ready) -> Result<(), String> {
-    let target = std::env::current_exe().map_err(|e| e.to_string())?;
+    let target = installed_widget_exe()?;
     let ps1 = ready.dir.join("update.ps1");
     std::fs::write(&ps1, helper_script()).map_err(|e| format!("Could not write the update helper: {e}"))?;
     Command::new("powershell.exe")
@@ -383,7 +392,7 @@ mod install_tests {
     #[test]
     fn helper_swaps_manager_too() {
         let s = helper_script();
-        for needle in ["$NewManager", "claude-usage-manager.exe", "Stop-Process"] {
+        for needle in ["$NewManager", "claude-usage-manager.exe", "Stop-Process", "claude-usage-widget"] {
             assert!(s.contains(needle), "missing {needle}");
         }
     }

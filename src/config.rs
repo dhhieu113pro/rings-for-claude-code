@@ -105,11 +105,17 @@ pub fn resolve_dir(p: &ProfileConfig) -> PathBuf {
     home().join(".claude")
 }
 
-/// Trims fields, turns blank optional ones into `None` and checks the result is usable.
-pub fn normalize(mut cfg: Config) -> Result<Config, String> {
-    if cfg.refresh_seconds < 15 {
+/// The one rule for the poll interval, shared by saving and by the Settings page's live hint.
+pub fn validate_refresh(seconds: u64) -> Result<(), String> {
+    if seconds < 15 {
         return Err("refresh must be at least 15 seconds".into());
     }
+    Ok(())
+}
+
+/// Trims fields, turns blank optional ones into `None` and checks the result is usable.
+pub fn normalize(mut cfg: Config) -> Result<Config, String> {
+    validate_refresh(cfg.refresh_seconds)?;
     if !matches!(cfg.theme.as_str(), "system" | "light" | "dark") {
         return Err("theme must be system, light or dark".into());
     }

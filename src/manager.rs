@@ -30,6 +30,30 @@ pub fn refresh_widget() {
     }
 }
 
+/// Named event the widget waits on to show itself (raise the window and flash it briefly).
+pub fn show_event_name() -> PCWSTR {
+    if cfg!(test) {
+        w!("Local\\ClaudeUsageWidgetShowTest")
+    } else {
+        w!("Local\\ClaudeUsageWidgetShow")
+    }
+}
+
+/// Asks the running widget to show itself. Returns false when no widget is listening, so the
+/// caller can start one.
+pub fn show_widget() -> bool {
+    unsafe {
+        match OpenEventW(EVENT_MODIFY_STATE, false, show_event_name()) {
+            Ok(h) => {
+                let _ = SetEvent(h);
+                let _ = CloseHandle(h);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 /// Manager window theme. `System` follows Windows' app mode and is the default.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
@@ -87,17 +111,22 @@ pub fn level_rgb(used: f32) -> (f32, f32, f32) {
     }
 }
 
-/// Manager pages; `arg()` is what the tray passes as `--page`.
+/// Manager pages; `arg()` is what the tray passes as `--page`. `Home` is the dashboard and the
+/// page shown when none is asked for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
+    Home,
     Profiles,
     Mcp,
     Settings,
 }
 
 impl Page {
+    pub const ALL: [Page; 4] = [Page::Home, Page::Profiles, Page::Mcp, Page::Settings];
+
     pub fn label(self) -> &'static str {
         match self {
+            Page::Home => "Home",
             Page::Profiles => "Profiles",
             Page::Mcp => "MCP servers",
             Page::Settings => "Settings",
@@ -105,14 +134,62 @@ impl Page {
     }
     pub fn arg(self) -> &'static str {
         match self {
+            Page::Home => "home",
             Page::Profiles => "profiles",
             Page::Mcp => "mcp",
             Page::Settings => "settings",
         }
     }
     pub fn parse(s: &str) -> Option<Page> {
-        [Page::Profiles, Page::Mcp, Page::Settings].into_iter().find(|p| p.arg() == s)
+        Page::ALL.into_iter().find(|p| p.arg() == s)
     }
+    /// A missing or unknown page means the dashboard.
+    pub fn parse_or_home(s: Option<&str>) -> Page {
+        s.and_then(Page::parse).unwrap_or(Page::Home)
+    }
+}
+
+/// A calendar date: year, month (1-12), day.
+pub type Ymd = (i32, u32, u32);
+
+/// Days since 1970-01-01 for a civil date (proleptic Gregorian).
+fn days_from_civil((y, m, d): Ymd) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y } as i64;
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Turns the widget's reset text ("Nov 12") into the next such date on or after `today`
+/// (a past month/day means next year) and the number of days until it.
+pub fn upcoming_reset(text: &str, today: Ymd) -> Option<(Ymd, i64)> {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mut parts = text.split_whitespace();
+    let month = parts.next()?;
+    let month = MONTHS.iter().position(|m| m.eq_ignore_ascii_case(month))? as u32 + 1;
+    let day: u32 = parts.next()?.trim_end_matches(',').parse().ok()?;
+    if parts.next().is_some() || day == 0 || day > 31 {
+        return None;
+    }
+    let now = days_from_civil(today);
+    let mut date = (today.0, month, day);
+    if days_from_civil(date) < now {
+        date.0 += 1;
+    }
+    Some((date, days_from_civil(date) - now))
+}
+
+/// Each account's share (0..=1) of the combined weekly usage. Accounts without a reading get 0;
+/// when nobody has used anything every share is 0 rather than a made-up even split.
+pub fn usage_shares(weekly: &[Option<f32>]) -> Vec<f32> {
+    let total: f32 = weekly.iter().flatten().map(|u| u.max(0.0)).sum();
+    weekly
+        .iter()
+        .map(|u| if total > 0.0 { u.unwrap_or(0.0).max(0.0) / total } else { 0.0 })
+        .collect()
 }
 
 /// One profile's latest reading, as written by the widget.
@@ -444,6 +521,19 @@ mod tests {
     }
 
     #[test]
+    fn show_widget_reports_whether_a_widget_listens() {
+        let _env = Env::new("showwidget");
+        assert!(!show_widget(), "no widget running: caller must start one");
+        let event = unsafe { CreateEventW(None, false, false, show_event_name()).unwrap() };
+        assert!(show_widget());
+        assert_eq!(unsafe { WaitForSingleObject(event, 1000) }, WAIT_OBJECT_0);
+        unsafe {
+            let _ = CloseHandle(event);
+        }
+        assert!(!show_widget(), "event gone again");
+    }
+
+    #[test]
     fn toggle_import_delete_fresh_state() {
         let env = Env::new("toggle");
         let dir = env.dir("pa");
@@ -546,9 +636,40 @@ mod tests {
 
     #[test]
     fn page_args_round_trip() {
-        for p in [Page::Profiles, Page::Mcp, Page::Settings] {
+        for p in Page::ALL {
             assert_eq!(Page::parse(p.arg()), Some(p));
         }
         assert_eq!(Page::parse("nope"), None);
+    }
+
+    #[test]
+    fn no_page_means_the_dashboard() {
+        assert_eq!(Page::parse_or_home(None), Page::Home);
+        assert_eq!(Page::parse_or_home(Some("bogus")), Page::Home);
+        assert_eq!(Page::parse_or_home(Some("mcp")), Page::Mcp);
+    }
+
+    #[test]
+    fn reset_dates_roll_into_next_year_and_count_days() {
+        let today = (2026, 11, 6);
+        assert_eq!(upcoming_reset("Nov 12", today), Some(((2026, 11, 12), 6)));
+        assert_eq!(upcoming_reset("Nov 6", today), Some(((2026, 11, 6), 0)), "today counts");
+        assert_eq!(upcoming_reset("nov 7", today), Some(((2026, 11, 7), 1)), "case-insensitive");
+        // A date already past this year means the next one: Jan 2 is 57 days after Nov 6.
+        assert_eq!(upcoming_reset("Jan 2", today), Some(((2027, 1, 2), 57)));
+        // Leap day arithmetic: Feb 28 -> Mar 1 spans the 29th in 2028.
+        assert_eq!(upcoming_reset("Mar 1", (2028, 2, 28)), Some(((2028, 3, 1), 2)));
+        for bad in ["", "Nov", "Foo 3", "Nov 0", "Nov 32", "Nov 3 4", "12 Nov"] {
+            assert_eq!(upcoming_reset(bad, today), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn usage_shares_are_real_proportions() {
+        let s = usage_shares(&[Some(30.0), Some(10.0), None, Some(60.0)]);
+        assert!((s[0] - 0.3).abs() < 1e-6 && (s[1] - 0.1).abs() < 1e-6 && s[2] == 0.0 && (s[3] - 0.6).abs() < 1e-6);
+        assert!((s.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert_eq!(usage_shares(&[Some(0.0), None]), vec![0.0, 0.0], "no usage: no invented split");
+        assert!(usage_shares(&[]).is_empty());
     }
 }

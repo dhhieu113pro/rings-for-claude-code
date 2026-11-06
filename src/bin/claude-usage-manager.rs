@@ -3,6 +3,7 @@
 //! running instance (named mutex + event + `manager-nav.txt`) and exits.
 use claude_usage_widget::config;
 use claude_usage_widget::manager::{self, ManagerState, Page, ProfileCard, Theme};
+use claude_usage_widget::update;
 use std::path::PathBuf;
 use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, WAIT_OBJECT_0};
@@ -154,8 +155,8 @@ enum ManagerMsg {
     Widget(Page),
     /// The sidebar was collapsed or expanded.
     ToggleNav,
-    /// The theme button in the title bar: System, Light, Dark, System...
-    CycleTheme,
+    /// The title-bar button: bring up the rings widget, starting it if it is not running.
+    ShowRings,
     /// A selection event with nothing to act on.
     Ignore,
     /// The Settings page saved a new theme.
@@ -183,16 +184,16 @@ impl ManagerRoot {
 fn wait_for_navigation(context: &ComponentContext<ManagerRoot>) {
     context.spawn_background(|token| {
         let ev = unsafe { CreateEventW(None, false, false, w!("Local\\ClaudeUsageManagerNavigate")) };
-        let Ok(ev) = ev else { return ManagerMsg::Widget(Page::Profiles) };
+        let Ok(ev) = ev else { return ManagerMsg::Widget(Page::Home) };
         loop {
             if token.is_cancelled() {
-                return ManagerMsg::Select(Page::Profiles);
+                return ManagerMsg::Ignore;
             }
             if unsafe { WaitForSingleObject(ev, 500) } == WAIT_OBJECT_0 {
                 let page = std::fs::read_to_string(nav_file())
                     .ok()
                     .and_then(|t| Page::parse(t.trim()))
-                    .unwrap_or(Page::Profiles);
+                    .unwrap_or(Page::Home);
                 return ManagerMsg::Widget(page);
             }
         }
@@ -227,16 +228,7 @@ impl Component for ManagerRoot {
             }
             ManagerMsg::Ignore => {}
             ManagerMsg::ToggleNav => self.nav_open = !self.nav_open,
-            ManagerMsg::CycleTheme => {
-                let next = match self.theme {
-                    Theme::System => Theme::Light,
-                    Theme::Light => Theme::Dark,
-                    Theme::Dark => Theme::System,
-                };
-                if manager::save_theme(next).is_ok() {
-                    self.theme = next;
-                }
-            }
+            ManagerMsg::ShowRings => show_rings(),
             ManagerMsg::SetTheme(t) => self.theme = t,
             ManagerMsg::Widget(p) => {
                 self.page = p;
@@ -260,11 +252,12 @@ impl Component for ManagerRoot {
         }
         context.window_visuals(visuals);
         let icon_of = |p: Page| match p {
+            Page::Home => Symbol::Home,
             Page::Profiles => Symbol::People,
             Page::Mcp => Symbol::Link,
             Page::Settings => Symbol::Setting,
         };
-        let items: Vec<KeyedView> = [Page::Profiles, Page::Mcp, Page::Settings]
+        let items: Vec<KeyedView> = Page::ALL
             .into_iter()
             .map(|p| {
                 KeyedView::new(
@@ -280,11 +273,13 @@ impl Component for ManagerRoot {
             })
             .collect();
         let page: View = match self.page {
+            Page::Home => View::component::<HomePage>(self.dark()),
             Page::Profiles => View::component::<ProfilesPage>(self.dark()),
-            Page::Mcp => View::component::<McpPage>(()),
+            Page::Mcp => View::component::<McpPage>(self.dark()),
             Page::Settings => View::component::<SettingsPage>(SettingsInput {
                 on_theme: context.callback(ManagerMsg::SetTheme),
                 theme: self.theme,
+                dark: self.dark(),
             }),
         };
         // An explicit page colour keeps the canvas rings seamless in every theme.
@@ -306,8 +301,8 @@ impl Component for ManagerRoot {
             .slot(
                 TitleBarSlot::RightHeader,
                 Button::new()
-                    .on_click(context.message(ManagerMsg::CycleTheme))
-                    .content(format!("Theme: {}", self.theme.label())),
+                    .on_click(context.message(ManagerMsg::ShowRings))
+                    .content("Show rings"),
             );
         let nav = NavigationView::new()
             .pane_display_mode(NavigationViewPaneDisplayMode::Left)
@@ -330,6 +325,329 @@ impl Component for ManagerRoot {
     }
 }
 
+
+/// Solid card colour per theme. Cards are slightly lighter than the page; the canvas rings are
+/// cleared to this exact value so they blend in.
+fn card_gray(dark: bool) -> u8 {
+    if dark { 0x2B } else { 0xFB }
+}
+
+/// A gallery-style card: rounded, hairline border, raised a step from the page.
+fn card(dark: bool, child: impl Into<View>) -> View {
+    let g = card_gray(dark);
+    Border::new()
+        .background(Color::rgb(g, g, g))
+        .border_brush(ThemeBrush::CardStroke)
+        .border_thickness(Thickness::uniform(1.0))
+        .corner_radius(CornerRadius::uniform(8.0))
+        .padding(Thickness::uniform(16.0))
+        .content(child)
+}
+
+/// Secondary text (paths, hints, descriptions).
+fn dim(text: impl Into<String>) -> TextBlock {
+    TextBlock::new()
+        .text(text)
+        .font_size(12.0)
+        .foreground(Color::rgb(0x8A, 0x8A, 0x8A))
+        .text_wrapping(TextWrapping::WrapWholeWords)
+}
+
+/// Card title.
+fn title(text: impl Into<String>) -> TextBlock {
+    TextBlock::new().text(text).font_size(16.0).font_weight(FontWeight::SEMI_BOLD)
+}
+
+/// An inline error line that takes no room while empty.
+fn error_note(text: String) -> View {
+    if text.is_empty() {
+        Grid::new().height(0.0).into()
+    } else {
+        TextBlock::new()
+            .text(text)
+            .foreground(ThemeBrush::SystemCritical)
+            .text_wrapping(TextWrapping::WrapWholeWords)
+            .into()
+    }
+}
+
+/// A small rounded label such as `stdio` / `http`.
+fn badge(text: &str) -> View {
+    Border::new()
+        .background(Color::argb(48, 128, 128, 128))
+        .corner_radius(CornerRadius::uniform(4.0))
+        .padding(Thickness::xy(8.0, 2.0))
+        .content(dim(text))
+}
+
+/// A card for an empty list: what is missing and what to do about it.
+fn empty_card(dark: bool, headline: &str, hint: &str) -> View {
+    card(
+        dark,
+        StackPanel::new().spacing(4.0).children((TextBlock::new().text(headline).font_size(16.0), dim(hint))),
+    )
+}
+
+// ---------------------------------------------------------------- Home (dashboard)
+
+/// Today's local date.
+fn today() -> manager::Ymd {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let t = unsafe { GetLocalTime() };
+    (t.wYear as i32, t.wMonth as u32, t.wDay as u32)
+}
+
+/// Distinct, theme-neutral slice colours; cycles for more than eight accounts.
+fn palette(i: usize) -> (u8, u8, u8) {
+    const P: [(u8, u8, u8); 8] = [
+        (0x4C, 0xA3, 0xFF),
+        (0xF5, 0x9E, 0x0B),
+        (0x34, 0xD3, 0x99),
+        (0xE8, 0x6C, 0xA8),
+        (0x9B, 0x8A, 0xFB),
+        (0xF4, 0x72, 0x5B),
+        (0x2D, 0xD4, 0xD4),
+        (0xB5, 0xD3, 0x3D),
+    ];
+    P[i % P.len()]
+}
+
+/// What the dashboard shows, worked out once from the profile cards so it can be tested.
+struct Dashboard {
+    accounts: usize,
+    with_reading: usize,
+    /// Highest weekly use: name and percent.
+    top: Option<(String, f32)>,
+    /// Weekly usage as shares of the combined total, one per account (same order as the cards).
+    shares: Vec<f32>,
+    /// Average weekly use over accounts that have a reading.
+    average: Option<f32>,
+    /// Soonest first: (days until, date text, account).
+    resets: Vec<(i64, String, String)>,
+    /// Accounts whose usage could not be read.
+    problems: Vec<String>,
+}
+
+impl Dashboard {
+    fn build(profiles: &[ProfileCard], today: manager::Ymd) -> Self {
+        let weekly: Vec<Option<f32>> = profiles.iter().map(|p| p.weekly_used).collect();
+        let readings: Vec<(String, f32)> =
+            profiles.iter().filter_map(|p| p.weekly_used.map(|u| (p.name.clone(), u))).collect();
+        let top = readings.iter().cloned().max_by(|a, b| a.1.total_cmp(&b.1));
+        let average = (!readings.is_empty()).then(|| readings.iter().map(|r| r.1).sum::<f32>() / readings.len() as f32);
+        let mut resets: Vec<(i64, String, String)> = profiles
+            .iter()
+            .filter_map(|p| {
+                let text = p.weekly_reset.as_ref()?;
+                let (_, days) = manager::upcoming_reset(text, today)?;
+                Some((days, text.clone(), p.name.clone()))
+            })
+            .collect();
+        resets.sort();
+        let problems = profiles
+            .iter()
+            .filter_map(|p| p.error.as_ref().map(|e| format!("{}: {e}", p.name)))
+            .collect();
+        Self {
+            accounts: profiles.len(),
+            with_reading: readings.len(),
+            top,
+            shares: manager::usage_shares(&weekly),
+            average,
+            resets,
+            problems,
+        }
+    }
+}
+
+fn in_days(days: i64) -> String {
+    match days {
+        0 => "today".into(),
+        1 => "tomorrow".into(),
+        n => format!("in {n} days"),
+    }
+}
+
+/// Points along an arc between two fractions of a turn (0 = 12 o'clock, clockwise).
+fn arc_between(cx: f32, cy: f32, r: f32, from: f32, to: f32) -> Vec<(f32, f32)> {
+    let steps = (((to - from).abs() * 120.0).ceil() as usize).max(1);
+    (0..=steps)
+        .map(|i| {
+            let f = from + (to - from) * i as f32 / steps as f32;
+            let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * f;
+            (cx + r * a.cos(), cy + r * a.sin())
+        })
+        .collect()
+}
+
+/// A donut of per-account shares. With no usage at all it is just the empty track.
+fn donut(shares: Vec<f32>, dark: bool) -> View {
+    const SIZE: f64 = 170.0;
+    const STROKE: f32 = 18.0;
+    let canvas = windows_canvas::canvas(move |dc| {
+        use windows_canvas::{CapStyle, ColorF, Ellipse, PathBuilder, StrokeStyleBuilder, Vector2};
+        let (cx, cy) = (dc.width / 2.0, dc.height / 2.0);
+        let r = (dc.width.min(dc.height) - STROKE) / 2.0;
+        let bg = card_gray(dark) as f32 / 255.0;
+        dc.clear(ColorF::new(bg, bg, bg, 1.0));
+        let track = dc.create_solid_brush(ColorF::new(0.5, 0.5, 0.5, 0.25))?;
+        dc.draw_ellipse(&Ellipse::new(Vector2::new(cx, cy), r, r), &track, STROKE);
+        let style = dc.device().create_stroke_style(&StrokeStyleBuilder::new().caps(CapStyle::Flat))?;
+        let mut start = 0.0f32;
+        for (i, share) in shares.iter().enumerate().filter(|(_, s)| **s > 0.0) {
+            // A full-circle slice would have identical ends; stop a hair short.
+            let end = (start + share).min(start + 0.9995);
+            let (red, green, blue) = palette(i);
+            let brush = dc.create_solid_brush(ColorF::new(red as f32 / 255.0, green as f32 / 255.0, blue as f32 / 255.0, 1.0))?;
+            let pts = arc_between(cx, cy, r, start, end);
+            let mut figure = PathBuilder::new(dc.device())?.begin_hollow(Vector2::new(pts[0].0, pts[0].1));
+            for p in &pts[1..] {
+                figure = figure.line_to(Vector2::new(p.0, p.1));
+            }
+            let path = figure.end_open().build()?;
+            dc.draw_path_styled(&path, &brush, STROKE, &style);
+            start += share;
+        }
+        Ok(())
+    });
+    Grid::new().width(SIZE).height(SIZE).children((canvas,))
+}
+
+
+struct HomePage {
+    profiles: Vec<ProfileCard>,
+    today: manager::Ymd,
+}
+
+impl Component for HomePage {
+    type Input = bool; // dark theme
+    type Message = ();
+
+    fn create(_: &bool, _: &ComponentContext<Self>) -> Self {
+        Self { profiles: manager::snapshot().profiles, today: today() }
+    }
+
+    fn view(&self, dark: &bool, _: &mut ViewContext<Self>) -> View {
+        let dark = *dark;
+        let d = Dashboard::build(&self.profiles, self.today);
+
+        let stat = |col: i32, label: &str, value: String, sub: String| -> View {
+            StackPanel::new()
+                .grid_column(col)
+                .children((card(
+                    dark,
+                    StackPanel::new().spacing(2.0).children((
+                        dim(label),
+                        TextBlock::new().text(value).font_size(26.0).font_weight(FontWeight::SEMI_BOLD),
+                        dim(sub),
+                    )),
+                ),))
+                .into()
+        };
+        let next = d.resets.first();
+        let stats = Grid::new()
+            .columns([GridLength::STAR, GridLength::STAR, GridLength::STAR])
+            .column_spacing(8.0)
+            .children((
+                stat(
+                    0,
+                    "Accounts",
+                    d.accounts.to_string(),
+                    format!("{} with a usage reading", d.with_reading),
+                ),
+                stat(
+                    1,
+                    "Highest weekly use",
+                    d.top.as_ref().map(|t| format!("{:.0}%", t.1)).unwrap_or_else(|| "\u{2014}".into()),
+                    d.top.as_ref().map(|t| t.0.clone()).unwrap_or_else(|| "no readings yet".into()),
+                ),
+                stat(
+                    2,
+                    "Next weekly reset",
+                    next.map(|r| r.1.clone()).unwrap_or_else(|| "\u{2014}".into()),
+                    next.map(|r| format!("{} \u{b7} {}", r.2, in_days(r.0))).unwrap_or_else(|| "no reset dates yet".into()),
+                ),
+            ));
+
+        // Donut + legend: each account's share of the combined weekly usage.
+        let legend: Vec<KeyedView> = self
+            .profiles
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (r, g, b) = palette(i);
+                let dot = Border::new()
+                    .width(10.0)
+                    .height(10.0)
+                    .corner_radius(CornerRadius::uniform(5.0))
+                    .background(Color::rgb(r, g, b))
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .content(Grid::new());
+                let row = StackPanel::new().spacing(10.0).orientation(Orientation::Horizontal).children((
+                    dot,
+                    TextBlock::new().text(p.name.clone()),
+                    dim(format!("Week {}  \u{b7}  Session {}", percent_text(p.weekly_used), percent_text(p.session_used))),
+                ));
+                KeyedView::new(p.name.clone(), row)
+            })
+            .collect();
+        let centre = TextBlock::new()
+            .text(d.average.map(|a| format!("avg {a:.0}%")).unwrap_or_else(|| "\u{2014}".into()))
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center);
+        let chart = Grid::new().width(170.0).height(170.0).children((donut(d.shares.clone(), dark), centre));
+        let usage_card = card(
+            dark,
+            StackPanel::new().spacing(12.0).children((
+                title("Weekly usage by account"),
+                StackPanel::new().spacing(24.0).orientation(Orientation::Horizontal).children((
+                    chart,
+                    StackPanel::new()
+                        .spacing(8.0)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .keyed_children(legend),
+                )),
+                dim("Each slice is that account's share of the combined weekly usage."),
+            )),
+        );
+
+        let reset_rows: Vec<KeyedView> = d
+            .resets
+            .iter()
+            .map(|(days, date, name)| {
+                KeyedView::new(
+                    name.clone(),
+                    StackPanel::new().spacing(12.0).orientation(Orientation::Horizontal).children((
+                        TextBlock::new().text(date.clone()).font_weight(FontWeight::SEMI_BOLD),
+                        TextBlock::new().text(name.clone()),
+                        dim(in_days(*days)),
+                    )),
+                )
+            })
+            .collect();
+        let resets_body: View = if reset_rows.is_empty() {
+            dim("Reset dates appear after the first usage reading.").into()
+        } else {
+            StackPanel::new().spacing(8.0).keyed_children(reset_rows)
+        };
+        let resets_card = card(dark, StackPanel::new().spacing(12.0).children((title("Upcoming resets"), resets_body)));
+
+        let problems: View = if d.problems.is_empty() {
+            Grid::new().height(0.0).into()
+        } else {
+            let lines: Vec<KeyedView> =
+                d.problems.iter().enumerate().map(|(i, p)| KeyedView::new(i.to_string(), error_note(p.clone()))).collect();
+            card(dark, StackPanel::new().spacing(8.0).children((title("Needs attention"), StackPanel::new().spacing(4.0).keyed_children(lines))))
+        };
+
+        StackPanel::new().spacing(8.0).children((
+            stats,
+            usage_card,
+            resets_card,
+            problems,
+        ))
+    }
+}
 
 // ---------------------------------------------------------------- Profiles page
 
@@ -368,7 +686,7 @@ fn ring_meter(used: Option<f32>, dark: bool) -> View {
     let canvas = windows_canvas::canvas(move |dc| {
         let (cx, cy) = (dc.width / 2.0, dc.height / 2.0);
         let r = (dc.width.min(dc.height) - RING_STROKE) / 2.0;
-        let bg = page_gray(dark) as f32 / 255.0; // matches the page behind the canvas
+        let bg = card_gray(dark) as f32 / 255.0; // matches the card behind the canvas
         dc.clear(windows_canvas::ColorF::new(bg, bg, bg, 1.0));
         let track = dc.create_solid_brush(windows_canvas::ColorF::new(0.5, 0.5, 0.5, 0.25))?;
         dc.draw_ellipse(&windows_canvas::Ellipse::new(windows_canvas::Vector2::new(cx, cy), r, r), &track, RING_STROKE);
@@ -611,6 +929,7 @@ impl Component for ProfilesPage {
 
     fn view(&self, dark: &bool, context: &mut ViewContext<Self>) -> View {
         let m = &self.model;
+        let dark = *dark;
         let cards: Vec<KeyedView> = m
             .state
             .profiles
@@ -623,43 +942,58 @@ impl Component for ProfilesPage {
                     p.weekly_reset.as_ref().map(|d| format!(" (resets {d})")).unwrap_or_default()
                 );
                 let mcps = if p.mcps.is_empty() { "no MCP servers".to_string() } else { p.mcps.join(" \u{b7} ") };
-                let card = StackPanel::new().spacing(4.0).children((
-                    TextBlock::new().text(p.name.clone()),
-                    TextBlock::new().text(p.dir.clone()),
-                    StackPanel::new().spacing(12.0).orientation(Orientation::Horizontal).children((
-                        ring_meter(p.session_used, *dark),
-                        ring_meter(p.weekly_used, *dark),
-                        TextBlock::new().text(usage),
-                    )),
-                    TextBlock::new().text(mcps).max_width(680.0).horizontal_alignment(HorizontalAlignment::Left).text_wrapping(TextWrapping::WrapWholeWords),
-                    note(p.error.clone().unwrap_or_default()),
-                    StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
+                let rings = StackPanel::new()
+                    .spacing(10.0)
+                    .orientation(Orientation::Horizontal)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .grid_column(0)
+                    .children((ring_meter(p.session_used, dark), ring_meter(p.weekly_used, dark)));
+                let info = StackPanel::new().spacing(3.0).grid_column(1).children((
+                    title(p.name.clone()),
+                    dim(p.dir.clone()),
+                    TextBlock::new().text(usage).margin(Thickness::new(0.0, 6.0, 0.0, 0.0)),
+                    dim(mcps),
+                    error_note(p.error.clone().unwrap_or_default()),
+                ));
+                let actions = StackPanel::new()
+                    .spacing(8.0)
+                    .orientation(Orientation::Horizontal)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .grid_column(2)
+                    .children((
                         Button::new().on_click(context.message(ProfilesMsg::Edit(p.name.clone()))).content("Edit"),
                         Button::new().on_click(context.message(ProfilesMsg::Remove(p.name.clone()))).content("Remove"),
-                    )),
-                ));
-                KeyedView::new(p.name.clone(), card)
+                    ));
+                let row = Grid::new()
+                    .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                    .column_spacing(20.0)
+                    .children((rings, info, actions));
+                KeyedView::new(p.name.clone(), card(dark, row))
             })
             .collect();
 
         let list: View = if cards.is_empty() {
-            TextBlock::new().text("No profiles yet.").into()
+            empty_card(dark, "No profiles yet.", "Create a new profile, or add an existing Claude config folder.")
         } else {
-            StackPanel::new().spacing(12.0).keyed_children(cards)
+            StackPanel::new().spacing(8.0).keyed_children(cards)
         };
         let page_error = if m.dialog == Dialog::None { m.error.clone().unwrap_or_default() } else { String::new() };
 
-        StackPanel::new().spacing(12.0).children((
+        StackPanel::new().spacing(16.0).children((
             StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
+                Button::new()
+                    .style(ButtonStyle::Accent)
+                    .on_click(context.message(ProfilesMsg::OpenNew))
+                    .content("+ New profile"),
                 Button::new().on_click(context.message(ProfilesMsg::OpenAdd)).content("Add existing..."),
-                Button::new().on_click(context.message(ProfilesMsg::OpenNew)).content("+ New profile"),
             )),
-            note(page_error),
+            error_note(page_error),
             list,
             self.dialog_view(context),
         ))
     }
 }
+
 
 impl ProfilesPage {
     fn dialog_view(&self, context: &mut ViewContext<Self>) -> View {
@@ -935,10 +1269,10 @@ struct McpPage {
 }
 
 impl Component for McpPage {
-    type Input = ();
+    type Input = bool; // dark theme
     type Message = McpMsg;
 
-    fn create(_: &(), _: &ComponentContext<Self>) -> Self {
+    fn create(_: &bool, _: &ComponentContext<Self>) -> Self {
         Self { model: McpModel::load() }
     }
 
@@ -964,8 +1298,9 @@ impl Component for McpPage {
         }
     }
 
-    fn view(&self, _: &(), context: &mut ViewContext<Self>) -> View {
+    fn view(&self, dark: &bool, context: &mut ViewContext<Self>) -> View {
         let m = &self.model;
+        let dark = *dark;
         let cards: Vec<KeyedView> = m
             .state
             .servers
@@ -994,36 +1329,60 @@ impl Component for McpPage {
                         KeyedView::new(p.name.clone(), view)
                     })
                     .collect();
-                let card = StackPanel::new().spacing(4.0).children((
-                    TextBlock::new().text(format!("{}  [{}]", s.name, s.kind)),
-                    TextBlock::new().text(summary.clone()).text_wrapping(TextWrapping::Wrap).tooltip(summary),
-                    StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).keyed_children(boxes),
-                    StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
+                // Rows of four so a long profile list wraps instead of running off the card.
+                let rows: Vec<KeyedView> = boxes
+                    .chunks(4)
+                    .enumerate()
+                    .map(|(i, c)| {
+                        KeyedView::new(format!("row{i}"), StackPanel::new().spacing(4.0).orientation(Orientation::Horizontal).keyed_children(c.to_vec()))
+                    })
+                    .collect();
+                let info = StackPanel::new().spacing(6.0).grid_column(0).children((
+                    StackPanel::new().spacing(10.0).orientation(Orientation::Horizontal).children((
+                        title(s.name.clone()),
+                        badge(&s.kind),
+                    )),
+                    dim(summary.clone()).tooltip(summary),
+                    dim("Enabled for"),
+                    StackPanel::new().spacing(2.0).keyed_children(rows),
+                ));
+                let actions = StackPanel::new()
+                    .spacing(8.0)
+                    .orientation(Orientation::Horizontal)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .grid_column(1)
+                    .children((
                         Button::new().on_click(context.message(McpMsg::Edit(s.name.clone()))).content("Edit"),
                         Button::new().on_click(context.message(McpMsg::Delete(s.name.clone()))).content("Delete"),
-                    )),
-                ));
-                KeyedView::new(s.name.clone(), card)
+                    ));
+                let row = Grid::new()
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .column_spacing(20.0)
+                    .children((info, actions));
+                KeyedView::new(s.name.clone(), card(dark, row))
             })
             .collect();
         let list: View = if cards.is_empty() {
-            TextBlock::new().text("No MCP servers yet.").into()
+            empty_card(dark, "No MCP servers yet.", "Add a server, or import the ones a profile already has.")
         } else {
-            StackPanel::new().spacing(12.0).keyed_children(cards)
+            StackPanel::new().spacing(8.0).keyed_children(cards)
         };
         let warnings: Vec<KeyedView> = m
             .state
             .profiles
             .iter()
-            .filter_map(|p| p.error.as_ref().map(|e| KeyedView::new(p.name.clone(), TextBlock::new().text(format!("{}: {e}", p.name)))))
+            .filter_map(|p| p.error.as_ref().map(|e| KeyedView::new(p.name.clone(), error_note(format!("{}: {e}", p.name)))))
             .collect();
         let names: Vec<String> = m.state.profiles.iter().map(|p| p.name.clone()).collect();
         let page_error = if m.dialog == McpDialog::None { m.error.clone().unwrap_or_default() } else { String::new() };
 
-        StackPanel::new().spacing(12.0).children((
+        StackPanel::new().spacing(16.0).children((
             StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
-                Button::new().on_click(context.message(McpMsg::Add)).content("+ Add server"),
-                TextBlock::new().text("Import from"),
+                Button::new()
+                    .style(ButtonStyle::Accent)
+                    .on_click(context.message(McpMsg::Add))
+                    .content("+ Add server"),
+                dim("Import from").vertical_alignment(VerticalAlignment::Center).margin(Thickness::new(16.0, 0.0, 0.0, 0.0)),
                 ComboBox::new()
                     .items_source(names)
                     .selected_index(if m.state.profiles.is_empty() { None } else { Some(m.import_from) })
@@ -1031,13 +1390,14 @@ impl Component for McpPage {
                 Button::new().on_click(context.message(McpMsg::Import)).content("Import"),
             )),
             note(m.notice.clone().unwrap_or_default()),
-            note(page_error),
+            error_note(page_error),
             list,
             StackPanel::new().spacing(4.0).keyed_children(warnings),
             self.dialog_view(context),
         ))
     }
 }
+
 
 impl McpPage {
     fn dialog_view(&self, context: &mut ViewContext<Self>) -> View {
@@ -1096,23 +1456,57 @@ impl McpPage {
 
 // ---------------------------------------------------------------- Settings page
 
+/// A valid refresh interval typed but not yet saved. Leaving the page saves it; this covers
+/// closing the window, where the page is never dropped on the way out.
+static PENDING_REFRESH: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+fn flush_pending_refresh() {
+    let pending = PENDING_REFRESH.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(n) = pending {
+        let _ = manager::save_settings(n);
+    }
+}
+
 struct SettingsModel {
-    /// Text of the refresh box; parsed only on save.
+    /// Text of the refresh box.
     seconds: String,
+    /// The value already stored, so leaving the page only writes (and refreshes the widget) when
+    /// the text really changed.
+    committed: String,
     error: Option<String>,
     saved: bool,
     theme: Theme,
+    update: UpdateState,
 }
 
 impl SettingsModel {
     fn load() -> Self {
         let cfg = config::load();
-        Self { seconds: cfg.refresh_seconds.to_string(), error: None, saved: false, theme: Theme::parse(&cfg.theme) }
+        let seconds = cfg.refresh_seconds.to_string();
+        Self {
+            committed: seconds.clone(),
+            seconds,
+            error: None,
+            saved: false,
+            theme: Theme::parse(&cfg.theme),
+            update: UpdateState::Idle,
+        }
     }
 
+    /// Typing only validates: the hint appears at once, nothing is written until the user leaves.
     fn set_seconds(&mut self, text: String) {
         self.seconds = text;
         self.saved = false;
+        self.error = match self.seconds.trim().parse::<u64>() {
+            Err(_) => Some("Enter a number of seconds.".into()),
+            Ok(n) => config::validate_refresh(n).err(),
+        };
+        // Remember a valid, changed value so closing the window can still save it.
+        let pending = match (self.error.is_none(), self.seconds.trim().parse::<u64>()) {
+            (true, Ok(n)) if self.seconds.trim() != self.committed => Some(n),
+            _ => None,
+        };
+        *PENDING_REFRESH.lock().unwrap_or_else(|e| e.into_inner()) = pending;
     }
 
     /// Parse failures and `save_settings` errors stay inline; nothing is written on error.
@@ -1124,9 +1518,76 @@ impl SettingsModel {
                 Ok(()) => {
                     self.error = None;
                     self.saved = true;
+                    self.committed = self.seconds.trim().to_string();
+                    *PENDING_REFRESH.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
                 Err(e) => self.error = Some(e),
             },
+        }
+    }
+
+    /// Called when the user leaves the page or closes the window. An invalid entry is dropped
+    /// (the stored value stays), an unchanged one is not rewritten.
+    fn commit_on_leave(&mut self) {
+        if self.seconds.trim() != self.committed {
+            self.save();
+        }
+    }
+}
+
+/// Where the "Check for updates" card is. The network work happens in background tasks; these
+/// transitions are plain so they can be tested without a network.
+#[derive(Clone, PartialEq, Debug)]
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(update::Release),
+    Installing,
+    Failed(String),
+}
+
+impl SettingsModel {
+    fn busy(&self) -> bool {
+        matches!(self.update, UpdateState::Checking | UpdateState::Installing)
+    }
+
+    /// Returns whether a check should start (not while one is running or installing).
+    fn start_check(&mut self) -> bool {
+        if self.busy() {
+            return false;
+        }
+        self.update = UpdateState::Checking;
+        true
+    }
+
+    fn checked(&mut self, result: Result<update::Release, String>, current: &str) {
+        self.update = match result {
+            Err(e) => UpdateState::Failed(e),
+            Ok(r) if update::is_newer(&r.tag, current) => UpdateState::Available(r),
+            Ok(_) => UpdateState::UpToDate,
+        };
+    }
+
+    /// Only an available update can be installed; returns it so the caller can start the download.
+    fn start_install(&mut self) -> Option<update::Release> {
+        match std::mem::replace(&mut self.update, UpdateState::Installing) {
+            UpdateState::Available(r) => Some(r),
+            other => {
+                self.update = other;
+                None
+            }
+        }
+    }
+
+    /// Ok means the helper took over and the app is about to exit; an error comes back inline.
+    fn installed(&mut self, result: Result<(), String>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                self.update = UpdateState::Failed(e);
+                false
+            }
         }
     }
 }
@@ -1134,8 +1595,11 @@ impl SettingsModel {
 #[derive(Clone)]
 enum SettingsMsg {
     Seconds(String),
-    Save,
     Theme(Theme),
+    CheckUpdates,
+    UpdateChecked(Result<update::Release, String>),
+    InstallUpdate,
+    Installed(Result<(), String>),
 }
 
 /// What the page needs from the window: a way to tell it the theme changed.
@@ -1144,10 +1608,18 @@ struct SettingsInput {
     on_theme: Callback<Theme>,
     /// The window's current theme, so the page shows the same choice when it changes elsewhere.
     theme: Theme,
+    dark: bool,
 }
 
 struct SettingsPage {
     model: SettingsModel,
+}
+
+/// Leaving the page (or closing the window) saves a changed, valid interval.
+impl Drop for SettingsPage {
+    fn drop(&mut self) {
+        self.model.commit_on_leave();
+    }
 }
 
 impl SettingsModel {
@@ -1180,51 +1652,142 @@ impl Component for SettingsPage {
     }
 
 
-    fn update(&mut self, message: SettingsMsg, _: &ComponentContext<Self>) {
+    fn update(&mut self, message: SettingsMsg, context: &ComponentContext<Self>) {
         match message {
             SettingsMsg::Seconds(t) => self.model.set_seconds(t),
-            SettingsMsg::Save => self.model.save(),
             SettingsMsg::Theme(t) => {
                 self.model.choose_theme(t);
+            }
+            SettingsMsg::CheckUpdates => {
+                if self.model.start_check() {
+                    context.spawn_background(|_| SettingsMsg::UpdateChecked(update::fetch_latest()));
+                }
+            }
+            SettingsMsg::UpdateChecked(result) => self.model.checked(result, env!("CARGO_PKG_VERSION")),
+            SettingsMsg::InstallUpdate => {
+                if let Some(release) = self.model.start_install() {
+                    context.spawn_background(move |_| {
+                        SettingsMsg::Installed(
+                            update::download_and_verify(&release).and_then(|ready| update::start_replace_helper(&ready)),
+                        )
+                    });
+                }
+            }
+            SettingsMsg::Installed(result) => {
+                if self.model.installed(result) {
+                    // The helper waits for this process to exit, swaps the exes and relaunches.
+                    std::process::exit(0);
+                }
             }
         }
     }
 
     fn view(&self, input: &SettingsInput, context: &mut ViewContext<Self>) -> View {
         let m = &self.model;
+        let dark = input.dark;
         let status = match (&m.error, m.saved) {
-            (Some(e), _) => e.clone(),
+            (Some(_), _) => String::new(),
             (None, true) => "Saved.".to_string(),
             _ => String::new(),
         };
-        let themes: Vec<KeyedView> = [Theme::System, Theme::Light, Theme::Dark]
-            .into_iter()
-            .map(|t| {
-                let on_theme = input.on_theme.clone();
-                let sender = context.sender();
-                KeyedView::new(
-                    t.arg(),
-                    Button::new()
-                        .style(if t == m.theme { ButtonStyle::Accent } else { ButtonStyle::Default })
-                        .on_click(Callback::new(move |_: ()| {
-                            // Save through the page, then let the window re-theme itself.
-                            if manager::save_theme(t).is_ok() {
-                                let _ = on_theme.call(t);
-                            }
-                            sender.send(SettingsMsg::Theme(t));
-                        }))
-                        .content(t.label()),
-                )
-            })
-            .collect();
+        let setting = |name: &str, hint: &str, extra: View, control: View| -> View {
+            let text = StackPanel::new().spacing(3.0).grid_column(0).children((title(name), dim(hint), extra));
+            let right = StackPanel::new()
+                .spacing(8.0)
+                .orientation(Orientation::Horizontal)
+                .vertical_alignment(VerticalAlignment::Center)
+                .grid_column(1)
+                .children((control,));
+            card(
+                dark,
+                Grid::new().columns([GridLength::STAR, GridLength::Auto]).column_spacing(20.0).children((text, right)),
+            )
+        };
+
+        // Theme: a ComboBox like the gallery's. The window and this page re-theme right away.
+        let themes = [Theme::System, Theme::Light, Theme::Dark];
+        let on_theme = input.on_theme.clone();
+        let sender = context.sender();
+        let current = m.theme;
+        let theme_box = ComboBox::new()
+            .items_source(themes.iter().map(|t| t.label().to_string()).collect::<Vec<_>>())
+            .selected_index(themes.iter().position(|t| *t == current))
+            .on_selection_changed(Callback::new(move |i: Option<usize>| {
+                let Some(t) = i.and_then(|i| themes.get(i).copied()) else { return };
+                if t != current && manager::save_theme(t).is_ok() {
+                    let _ = on_theme.call(t);
+                    sender.send(SettingsMsg::Theme(t));
+                }
+            }));
+
+        // Updates: status text on the left, actions on the right.
+        let busy = m.busy();
+        let update_status: View = match &m.update {
+            UpdateState::Idle => Grid::new().height(0.0).into(),
+            UpdateState::Checking => dim("Checking for updates...").into(),
+            UpdateState::UpToDate => TextBlock::new().text("You are up to date.").into(),
+            UpdateState::Available(r) => TextBlock::new().text(format!("{} is available.", r.tag)).into(),
+            UpdateState::Installing => dim("Downloading and installing. The app will restart.").into(),
+            UpdateState::Failed(e) => error_note(format!("Update failed: {e}")),
+        };
+        let check_button = Button::new()
+            .is_enabled(!busy)
+            .on_click(context.message(SettingsMsg::CheckUpdates))
+            .content("Check for updates");
+        let update_controls: View = match &m.update {
+            UpdateState::Available(r) => StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
+                Button::new()
+                    .style(ButtonStyle::Accent)
+                    .is_enabled(!busy)
+                    .on_click(context.message(SettingsMsg::InstallUpdate))
+                    .content(format!("Update to {} and restart", r.tag)),
+                check_button,
+            )).into(),
+            _ => check_button.into(),
+        };
+        let refresh_box = StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
+            TextBox::new()
+                .text(m.seconds.clone())
+                .width(120.0)
+                .on_text_changed(context.callback(SettingsMsg::Seconds)),
+        ));
+
         StackPanel::new().spacing(8.0).children((
-            TextBlock::new().text("Theme"),
-            StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).keyed_children(themes),
-            TextBlock::new().text("Refresh interval (seconds)"),
-            TextBox::new().text(m.seconds.clone()).max_width(240.0).horizontal_alignment(HorizontalAlignment::Left).on_text_changed(context.callback(SettingsMsg::Seconds)),
-            Button::new().on_click(context.message(SettingsMsg::Save)).content("Save"),
-            note(status),
+            setting(
+                "Theme",
+                "Choose how the manager looks. System follows your Windows app mode.",
+                Grid::new().height(0.0).into(),
+                theme_box.into(),
+            ),
+            setting(
+                "Refresh interval (seconds)",
+                "How often the widget asks Claude Code for usage (minimum 15). Saved when you leave this page.",
+                StackPanel::new().children((
+                    note(status),
+                    error_note(m.error.clone().unwrap_or_default()),
+                )).into(),
+                refresh_box.into(),
+            ),
+            setting(
+                "Check for updates",
+                &format!("Installed version: v{}", env!("CARGO_PKG_VERSION")),
+                update_status,
+                update_controls,
+            ),
         ))
+    }
+}
+
+
+/// Shows the rings widget: signal the running one, or start the widget exe next to this one.
+/// The widget itself keeps to a single instance, so a click racing a start is harmless.
+fn show_rings() {
+    if manager::show_widget() {
+        return;
+    }
+    let exe = std::env::current_exe().ok().map(|p| p.with_file_name("claude-usage-widget.exe"));
+    if let Some(exe) = exe.filter(|p| p.exists()) {
+        let _ = std::process::Command::new(exe).spawn();
     }
 }
 
@@ -1244,13 +1807,40 @@ fn fail(text: &str) -> ! {
     std::process::exit(1)
 }
 
+/// Centers the manager on the monitor that has the mouse, once, when its window first exists.
+/// (The reactor window API has no position setting, so this waits for the window and moves it.)
+fn center_when_ready() {
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, SetWindowPos, SWP_NOSIZE, SWP_NOZORDER};
+    std::thread::spawn(|| unsafe {
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let Ok(hwnd) = FindWindowW(None, &HSTRING::from(TITLE)) else { continue };
+            let mut win = RECT::default();
+            if GetWindowRect(hwnd, &mut win).is_err() || win.right <= win.left {
+                continue;
+            }
+            let mut cursor = POINT::default();
+            let _ = GetCursorPos(&mut cursor);
+            let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+                return;
+            }
+            let work = info.rcWork;
+            let (w, h) = (win.right - win.left, win.bottom - win.top);
+            let x = work.left + ((work.right - work.left - w) / 2).max(0);
+            let y = work.top + ((work.bottom - work.top - h) / 2).max(0);
+            let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+            return;
+        }
+    });
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let page = args
-        .windows(2)
-        .find(|w| w[0] == "--page")
-        .and_then(|w| Page::parse(&w[1]))
-        .unwrap_or(Page::Profiles);
+    let page = Page::parse_or_home(args.windows(2).find(|w| w[0] == "--page").map(|w| w[1].as_str()));
 
     // Keep the mutex handle alive for the whole process.
     let _mutex = unsafe { CreateMutexW(None, true, w!("Local\\ClaudeUsageManager")) };
@@ -1265,7 +1855,11 @@ fn main() {
         return;
     }
 
-    if App::run_component::<ManagerRoot>(ManagerInput { first: page }).is_err() {
+    center_when_ready();
+    let opened = App::run_component::<ManagerRoot>(ManagerInput { first: page });
+    // The window is closed and its pages are gone; save a typed interval that was never committed.
+    flush_pending_refresh();
+    if opened.is_err() {
         fail("Cannot open the manager window. The Windows App Runtime may be missing.");
     }
 }
@@ -1532,7 +2126,7 @@ mod tests {
         m.toggle("a", "s", true);
         assert!(m.error.is_some(), "the read error surfaces inline");
         assert_eq!(claude_json(&root, "a"), "{ not json", "file untouched");
-        let out = render::<McpPage>(());
+        let out = render::<McpPage>(true);
         assert!(out.contains("a: "), "warning card for the broken profile: {out}");
     }
 
@@ -1555,11 +2149,11 @@ mod tests {
     #[test]
     fn mcp_page_renders_matrix_and_empty_state() {
         let (_g, _root) = env("mcprender", &["a", "b"]);
-        assert!(render::<McpPage>(()).contains("No MCP servers yet."));
+        assert!(render::<McpPage>(true).contains("No MCP servers yet."));
         let mut m = McpModel::load();
         add_server(&mut m, "srv", "npx", "-y", "");
-        let out = render::<McpPage>(());
-        assert!(out.contains("srv  [stdio]") && out.contains("npx -y"), "{out}");
+        let out = render::<McpPage>(true);
+        assert!(out.contains("Str(\"srv\")") && out.contains("Str(\"stdio\")") && out.contains("npx -y"), "title, kind badge and summary: {}", out.len());
         assert!(out.contains("+ Add server") && out.contains("Import"), "{out}");
     }
 
@@ -1580,7 +2174,7 @@ mod tests {
         m.save();
         assert!(m.saved && m.error.is_none());
         assert_eq!(config::load().refresh_seconds, 42);
-        assert!(render::<SettingsPage>(SettingsInput { on_theme: Callback::new(|_| {}), theme: Theme::System }).contains("Refresh interval (seconds)"));
+        assert!(render::<SettingsPage>(SettingsInput { on_theme: Callback::new(|_| {}), theme: Theme::System, dark: false }).contains("Refresh interval (seconds)"));
     }
 
     #[test]
@@ -1594,7 +2188,7 @@ mod tests {
         assert_eq!(SettingsModel::load().theme, Theme::Dark, "reopening shows the saved choice");
         assert!(m.choose_theme(Theme::System));
         assert_eq!(config::load().theme, "system");
-        assert!(render::<SettingsPage>(SettingsInput { on_theme: Callback::new(|_| {}), theme: Theme::System }).contains("Theme"));
+        assert!(render::<SettingsPage>(SettingsInput { on_theme: Callback::new(|_| {}), theme: Theme::System, dark: false }).contains("Theme"));
     }
 
     #[test]
@@ -1611,6 +2205,72 @@ mod tests {
         };
         assert!(root(Theme::System, true).dark() && !root(Theme::System, false).dark());
         assert!(root(Theme::Dark, false).dark() && !root(Theme::Light, true).dark());
+    }
+
+    fn release(tag: &str) -> update::Release {
+        update::Release { tag: tag.into(), zip_url: "https://x.test/a.zip".into(), sha_url: "https://x.test/a.sha256".into() }
+    }
+
+    #[test]
+    fn closing_the_window_saves_a_typed_interval() {
+        let (_g, _root) = env("closesave", &["a"]);
+        *PENDING_REFRESH.lock().unwrap_or_else(|e| e.into_inner()) = None; // nothing left by other tests
+        let mut m = SettingsModel::load();
+        m.set_seconds("7".into());
+        flush_pending_refresh();
+        assert_eq!(config::load().refresh_seconds, 900, "invalid input is never written");
+        m.set_seconds("1500".into());
+        assert_eq!(config::load().refresh_seconds, 900, "typing alone does not write");
+        flush_pending_refresh();
+        assert_eq!(config::load().refresh_seconds, 1500, "closing the window saves it");
+        // Typing the stored value again, or saving explicitly, leaves nothing pending.
+        let mut m = SettingsModel::load();
+        m.set_seconds("1500".into());
+        m.set_seconds("2000".into());
+        m.save();
+        flush_pending_refresh();
+        assert_eq!(config::load().refresh_seconds, 2000);
+    }
+
+    #[test]
+    fn update_flow_states() {
+        let (_g, _root) = env("updates", &["a"]);
+        let mut m = SettingsModel::load();
+        assert_eq!(m.update, UpdateState::Idle);
+        assert!(m.start_install().is_none(), "nothing to install before a check");
+        assert_eq!(m.update, UpdateState::Idle, "refused install leaves the state alone");
+
+        assert!(m.start_check());
+        assert!(!m.start_check(), "no second check while one runs");
+        assert!(m.busy());
+        m.checked(Ok(release("v0.5.1")), "0.5.1");
+        assert_eq!(m.update, UpdateState::UpToDate, "same version is up to date");
+        m.checked(Ok(release("v0.4.0")), "0.5.1");
+        assert_eq!(m.update, UpdateState::UpToDate, "an older release is not an update");
+
+        assert!(m.start_check());
+        m.checked(Ok(release("v0.6.0")), "0.5.1");
+        assert_eq!(m.update, UpdateState::Available(release("v0.6.0")));
+        let r = m.start_install().expect("available update installs");
+        assert_eq!(r.tag, "v0.6.0");
+        assert_eq!(m.update, UpdateState::Installing);
+        assert!(!m.start_check(), "busy while installing");
+
+        // A failed install comes back inline and the user can check again.
+        assert!(!m.installed(Err("Checksum mismatch".into())));
+        assert_eq!(m.update, UpdateState::Failed("Checksum mismatch".into()));
+        assert!(m.start_check());
+        m.checked(Err("offline".into()), "0.5.1");
+        assert_eq!(m.update, UpdateState::Failed("offline".into()));
+        // Ok from the helper means the app is about to exit.
+        assert!(m.installed(Ok(())));
+    }
+
+    #[test]
+    fn settings_page_has_an_updates_card() {
+        let (_g, _root) = env("updatecard", &["a"]);
+        let out = render::<SettingsPage>(SettingsInput { on_theme: Callback::new(|_| {}), theme: Theme::System, dark: false });
+        assert!(out.contains("Check for updates") && out.contains("Installed version"), "{}", out.len());
     }
 
     #[test]

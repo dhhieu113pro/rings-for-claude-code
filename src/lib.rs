@@ -4,3 +4,4 @@ pub mod config;
 pub mod manager;
 pub mod mcp;
 pub mod profile;
+pub mod update;
