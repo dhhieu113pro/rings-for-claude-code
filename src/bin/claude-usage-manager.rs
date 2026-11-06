@@ -93,6 +93,10 @@ impl Component for ManagerRoot {
             Page::Mcp => View::component::<McpPage>(()),
             Page::Settings => View::component::<SettingsPage>(()),
         };
+        let content: View = ScrollViewer::new().content(StackPanel::new().spacing(16.0).children((
+            TextBlock::new().text(self.page.label()).font_size(24.0),
+            content,
+        )));
         NavigationView::new()
             .pane_display_mode(NavigationViewPaneDisplayMode::Left)
             .is_settings_visible(false)
@@ -163,7 +167,7 @@ enum Dialog {
     New { name: String, servers: Vec<String> },
     ConfirmRemove(String),
     Created(String),
-    Edit { original: String, name: String, command: String, config_dir: String },
+    Edit { original: Option<String>, name: String, command: String, config_dir: String },
 }
 
 /// Which field of the edit dialog changed.
@@ -201,6 +205,16 @@ struct ProfilesModel {
 impl ProfilesModel {
     fn load() -> Self {
         Self { state: manager::snapshot(), dialog: Dialog::None, error: None }
+    }
+
+    fn open_add_existing(&mut self) {
+        self.error = None;
+        self.dialog = Dialog::Edit {
+            original: None,
+            name: String::new(),
+            command: String::new(),
+            config_dir: String::new(),
+        };
     }
 
     fn open_new(&mut self) {
@@ -260,7 +274,7 @@ impl ProfilesModel {
         self.error = None;
         if let Some(p) = config::load().profiles.into_iter().find(|p| p.name == name) {
             self.dialog = Dialog::Edit {
-                original: p.name.clone(),
+                original: Some(p.name.clone()),
                 name: p.name,
                 command: p.command.unwrap_or_default(),
                 config_dir: p.config_dir.unwrap_or_default(),
@@ -290,7 +304,11 @@ impl ProfilesModel {
     fn submit_edit(&mut self) {
         let Dialog::Edit { original, name, command, config_dir } = &self.dialog else { return };
         let opt = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
-        match manager::edit_profile(original, name.trim(), opt(command), opt(config_dir)) {
+        let result = match original {
+            Some(o) => manager::edit_profile(o, name.trim(), opt(command), opt(config_dir)),
+            None => manager::add_profile(name.trim(), opt(command), opt(config_dir)),
+        };
+        match result {
             Ok(()) => {
                 self.state = manager::snapshot();
                 self.dialog = Dialog::None;
@@ -309,6 +327,7 @@ impl ProfilesModel {
 #[derive(Clone)]
 enum ProfilesMsg {
     OpenNew,
+    OpenAdd,
     Name(String),
     PickServer(String, bool),
     Remove(String),
@@ -335,6 +354,7 @@ impl Component for ProfilesPage {
         let m = &mut self.model;
         match message {
             ProfilesMsg::OpenNew => m.open_new(),
+            ProfilesMsg::OpenAdd => m.open_add_existing(),
             ProfilesMsg::Name(t) => m.set_name(t),
             ProfilesMsg::PickServer(s, on) => m.pick_server(&s, on),
             ProfilesMsg::Remove(n) => m.ask_remove(n),
@@ -394,7 +414,10 @@ impl Component for ProfilesPage {
         let page_error = if m.dialog == Dialog::None { m.error.clone().unwrap_or_default() } else { String::new() };
 
         StackPanel::new().spacing(12.0).children((
-            Button::new().on_click(context.message(ProfilesMsg::OpenNew)).content("+ New profile"),
+            StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
+                Button::new().on_click(context.message(ProfilesMsg::OpenAdd)).content("Add existing{2026}"),
+                Button::new().on_click(context.message(ProfilesMsg::OpenNew)).content("+ New profile"),
+            )),
             TextBlock::new().text(page_error),
             list,
             self.dialog_view(context),
@@ -437,9 +460,9 @@ impl ProfilesPage {
                         TextBlock::new().text(error),
                     )))
             }
-            Dialog::Edit { name, command, config_dir, .. } => ContentDialog::new()
+            Dialog::Edit { original, name, command, config_dir } => ContentDialog::new()
                 .is_open(true)
-                .title("Edit profile")
+                .title(if original.is_some() { "Edit profile" } else { "Add existing profile" })
                 .primary_button_text("Save")
                 .close_button_text("Cancel")
                 .on_closed(on_closed)
@@ -961,6 +984,8 @@ mod tests {
 
     #[test]
     fn root_mounts_and_sets_title() {
+        // Pages read the config, so this must not race the tests that swap APPDATA.
+        let (_g, _root) = env("root", &["a"]);
         let mut pump = Pump::new(RecordingRuntime::default());
         pump.mount_view(View::component::<ManagerRoot>(ManagerInput { first: Page::Mcp })).unwrap();
         pump.dispatch_components(16).unwrap();
@@ -1056,6 +1081,22 @@ mod tests {
         assert_eq!(cfg.profiles[0].config_dir.as_deref(), Some("D:\\other"));
         assert_eq!(cfg.profiles[1].name, "b");
         assert_eq!(m.state.profiles[0].name, "a2");
+    }
+
+    #[test]
+    fn add_existing_shows_a_folder_without_creating_files() {
+        let (_g, root) = env("addex", &["a"]);
+        let mut m = ProfilesModel::load();
+        m.open_add_existing();
+        m.set_field(EditField::Name, "old".into());
+        m.picked_folder(Some(root.join("a").display().to_string()));
+        m.submit_edit();
+        assert_eq!(m.dialog, Dialog::None, "{:?}", m.error);
+        assert_eq!(m.state.profiles.len(), 2);
+        m.open_add_existing();
+        m.set_field(EditField::Name, "a".into());
+        m.submit_edit();
+        assert!(m.error.as_deref().unwrap_or("").contains("appears twice"), "dialog={:?} error={:?} cfg={:?}", m.dialog, m.error, config::load().profiles.iter().map(|p| p.name.clone()).collect::<Vec<_>>());
     }
 
     #[test]

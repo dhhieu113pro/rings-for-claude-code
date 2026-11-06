@@ -195,6 +195,15 @@ pub fn new_profile(name: &str, servers: &[String]) -> Result<profile::Created, S
 
 /// Replaces the profile called `original`. The config is reloaded first, so changes made since
 /// the page was opened survive.
+/// "Add existing…": shows an existing config folder in the widget without creating anything.
+pub fn add_profile(name: &str, command: Option<String>, config_dir: Option<String>) -> Result<(), String> {
+    let mut cfg = config::load();
+    cfg.profiles.push(config::ProfileConfig { name: name.to_string(), command, config_dir });
+    config::save(&config::normalize(cfg)?)?;
+    refresh_widget();
+    Ok(())
+}
+
 pub fn edit_profile(
     original: &str,
     name: &str,
@@ -349,6 +358,19 @@ mod tests {
         assert_eq!(config::load().profiles.len(), 1);
         assert!(dir.join(".claude.json").is_file());
         assert_eq!(remove_profile("nope").unwrap_err(), "unknown profile");
+    }
+
+    #[test]
+    fn add_profile_appends_and_validates() {
+        let env = Env::new("addprofile");
+        env.config(900, &[("a", None)]);
+        add_profile("b", None, Some("D:\\claude-b".into())).unwrap();
+        let cfg = config::load();
+        assert_eq!(cfg.profiles.len(), 2);
+        assert_eq!(cfg.profiles[1].config_dir.as_deref(), Some("D:\\claude-b"));
+        let e = add_profile("a", None, None).unwrap_err();
+        assert!(e.contains("appears twice"), "{e}");
+        assert_eq!(config::load().profiles.len(), 2, "nothing written on error");
     }
 
     #[test]
