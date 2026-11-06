@@ -1,8 +1,7 @@
 #![windows_subsystem = "windows"]
 
-mod config;
-mod mcp;
-mod profile;
+use claude_usage_widget::manager::{self, Page};
+use claude_usage_widget::{config, mcp, profile};
 mod update;
 mod usage;
 mod web;
@@ -14,7 +13,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use windows::core::{w, Result, HRESULT, HSTRING};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
@@ -25,7 +25,7 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -525,13 +525,48 @@ fn set_click_through(hwnd: HWND, through: bool) {
     }
 }
 
-/// Opens one page of the local manager UI in the default browser.
-fn open_page(page: &str) {
-    if let Some(url) = web::url(page) {
-        unsafe {
-            ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
-        }
+/// Starts the manager window (a separate executable next to this one) on the given page.
+fn launch_manager(page: Page) {
+    let exe = std::env::current_exe().ok().map(|p| p.with_file_name("claude-usage-manager.exe"));
+    let ok = exe
+        .filter(|p| p.exists())
+        .map(|p| std::process::Command::new(p).arg("--page").arg(page.arg()).spawn().is_ok())
+        .unwrap_or(false);
+    if !ok {
+        message(
+            "Cannot start the manager (claude-usage-manager.exe not found next to the widget).",
+            MB_OK | MB_ICONWARNING,
+        );
     }
+}
+
+/// Forwards the manager's "something changed" event to the worker as a refresh request.
+fn spawn_refresh_listener() {
+    std::thread::spawn(|| unsafe {
+        let Ok(ev) = CreateEventW(None, false, false, manager::refresh_event_name()) else { return };
+        while WaitForSingleObject(ev, INFINITE) == WAIT_OBJECT_0 {
+            if let Some(tx) = REFRESH_TX.get() {
+                let _ = tx.send(());
+            }
+        }
+    });
+}
+
+/// Mirrors STATE into usage-cache.json for the manager process.
+fn write_usage_cache() {
+    let entries: Vec<manager::UsageEntry> = STATE
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| manager::UsageEntry {
+            name: s.name.clone(),
+            session_used: s.session_used,
+            weekly_used: s.weekly_used,
+            weekly_reset: s.weekly_reset.clone(),
+            error: s.error.clone(),
+        })
+        .collect();
+    let _ = manager::write_usage(&entries);
 }
 
 fn message(text: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
@@ -618,9 +653,9 @@ fn show_menu(hwnd: HWND) {
                 set_click_through(hwnd, !now);
                 repaint(hwnd);
             }
-            ID_PROFILES => open_page("/profiles"),
-            ID_MCP => open_page("/mcp"),
-            ID_CONFIG => open_page("/settings"),
+            ID_PROFILES => launch_manager(Page::Profiles),
+            ID_MCP => launch_manager(Page::Mcp),
+            ID_CONFIG => launch_manager(Page::Settings),
             ID_STARTUP => set_startup(!startup),
             ID_UPDATE => check_for_updates(hwnd),
             ID_QUIT => {
@@ -715,6 +750,7 @@ fn spawn_worker(hwnd: isize, rx: mpsc::Receiver<()>) {
                         }
                     }
                     drop(st);
+                    write_usage_cache();
                     notify(hwnd);
                 })
             })
@@ -793,6 +829,7 @@ fn main() -> Result<()> {
 
         let (tx, rx) = mpsc::channel();
         let _ = REFRESH_TX.set(tx);
+        spawn_refresh_listener();
         spawn_worker(hwnd.0 as isize, rx);
 
         let mut msg = MSG::default();

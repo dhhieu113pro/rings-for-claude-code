@@ -45,6 +45,7 @@ jobs:
           $name = "${{ env.BIN_NAME }}-${{ github.event.release.tag_name || github.ref_name }}-${{ matrix.arch }}"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}.exe" $name
+          Copy-Item "target/${{ matrix.target }}/release/claude-usage-manager.exe" $name
           Copy-Item README.md $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File "$name.zip.sha256" -Encoding ascii

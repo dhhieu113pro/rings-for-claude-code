@@ -166,6 +166,20 @@ pub fn fetch_latest() -> Result<Release, String> {
 pub struct Ready {
     pub dir: PathBuf,
     pub new_exe: PathBuf,
+    pub new_manager: PathBuf,
+}
+
+/// Both executables must be in the unpacked package folder; the error names the missing one.
+fn locate_package(folder: &std::path::Path) -> Result<(PathBuf, PathBuf), String> {
+    let find = |name: &str| {
+        let p = folder.join(name);
+        if p.is_file() {
+            Ok(p)
+        } else {
+            Err(format!("The downloaded package does not contain {name}."))
+        }
+    };
+    Ok((find("claude-usage-widget.exe")?, find("claude-usage-manager.exe")?))
 }
 
 /// Ok when the zip's SHA-256 matches the hash in the checksum file's text.
@@ -197,18 +211,11 @@ pub fn download_and_verify(r: &Release) -> Result<Ready, String> {
         // Absolute path so a GNU tar earlier on PATH can't shadow the Windows one.
         let root = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()));
         run(Command::new(root.join("System32").join("tar.exe")).arg("-xf").arg(&zip).arg("-C").arg(&dir))?;
-        let new_exe = dir
-            .join(format!("claude-usage-widget-{}-{}", r.tag, arch()))
-            .join("claude-usage-widget.exe");
-        if new_exe.is_file() {
-            Ok(new_exe)
-        } else {
-            Err("The downloaded package does not contain claude-usage-widget.exe.".to_string())
-        }
+        locate_package(&dir.join(format!("claude-usage-widget-{}-{}", r.tag, arch())))
     })();
 
     match result {
-        Ok(new_exe) => Ok(Ready { dir, new_exe }),
+        Ok((new_exe, new_manager)) => Ok(Ready { dir, new_exe, new_manager }),
         Err(e) => {
             let _ = std::fs::remove_dir_all(&dir);
             Err(e)
@@ -217,21 +224,34 @@ pub fn download_and_verify(r: &Release) -> Result<Ready, String> {
 }
 
 fn helper_script() -> &'static str {
-    r#"param([int]$ProcId, [string]$Target, [string]$NewExe, [string]$TempDir)
-$old = "${Target}.old"
+    r#"param([int]$ProcId, [string]$Target, [string]$NewExe, [string]$TempDir, [string]$NewManager)
+$manager = Join-Path (Split-Path $Target) 'claude-usage-manager.exe'
+$pairs = @(@($Target, $NewExe), @($manager, $NewManager))
 Wait-Process -Id $ProcId -Timeout 30 -ErrorAction SilentlyContinue
+Stop-Process -Name 'claude-usage-manager' -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
+$done = @()
 try {
     $ErrorActionPreference = 'Stop'
-    Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
-    Rename-Item -LiteralPath $Target -NewName (Split-Path $old -Leaf)
-    Copy-Item -LiteralPath $NewExe -Destination $Target
+    foreach ($p in $pairs) {
+        $old = "$($p[0]).old"
+        Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $p[0]) {
+            Rename-Item -LiteralPath $p[0] -NewName (Split-Path $old -Leaf)
+        }
+        $done += ,$p
+        Copy-Item -LiteralPath $p[1] -Destination $p[0]
+    }
     Start-Process -FilePath $Target
-    Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+    foreach ($p in $pairs) { Remove-Item -LiteralPath "$($p[0]).old" -Force -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $TempDir -Recurse -Force -ErrorAction SilentlyContinue
 } catch {
-    if (Test-Path -LiteralPath $old) {
-        Remove-Item -LiteralPath $Target -Force -ErrorAction SilentlyContinue
-        Rename-Item -LiteralPath $old -NewName (Split-Path $Target -Leaf)
+    foreach ($p in $done) {
+        $old = "$($p[0]).old"
+        if (Test-Path -LiteralPath $old) {
+            Remove-Item -LiteralPath $p[0] -Force -ErrorAction SilentlyContinue
+            Rename-Item -LiteralPath $old -NewName (Split-Path $p[0] -Leaf)
+        }
     }
     Start-Process -FilePath $Target
 }
@@ -253,6 +273,8 @@ pub fn start_replace_helper(ready: &Ready) -> Result<(), String> {
         .arg(&target)
         .arg("-NewExe")
         .arg(&ready.new_exe)
+        .arg("-NewManager")
+        .arg(&ready.new_manager)
         .arg("-TempDir")
         .arg(&ready.dir)
         .creation_flags(CREATE_NO_WINDOW)
@@ -341,6 +363,29 @@ mod install_tests {
         // The catch block must put the old exe back.
         let catch = &s[s.find("catch").unwrap()..];
         assert!(catch.contains("Rename-Item") && catch.contains("Start-Process"));
+    }
+
+    #[test]
+    fn package_needs_both_executables() {
+        let dir = std::env::temp_dir().join(format!("pkg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = locate_package(&dir).unwrap_err();
+        assert!(e.contains("claude-usage-widget.exe"), "{e}");
+        std::fs::write(dir.join("claude-usage-widget.exe"), b"x").unwrap();
+        let e = locate_package(&dir).unwrap_err();
+        assert!(e.contains("claude-usage-manager.exe"), "{e}");
+        std::fs::write(dir.join("claude-usage-manager.exe"), b"x").unwrap();
+        assert!(locate_package(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn helper_swaps_manager_too() {
+        let s = helper_script();
+        for needle in ["$NewManager", "claude-usage-manager.exe", "Stop-Process"] {
+            assert!(s.contains(needle), "missing {needle}");
+        }
     }
 
     #[test]
