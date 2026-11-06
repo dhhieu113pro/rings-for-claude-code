@@ -4,7 +4,7 @@
 
 **Goal:** Replace the browser-hosted manager (`src/web.rs` + 5 HTML/CSS/JS assets) with one native WinUI 3 window built with `windows-reactor`, driven by direct Rust calls.
 
-**Architecture:** New `src/manager.rs` holds a pure data layer (the Rust ports of `web.rs`'s API handlers, unit-tested) plus the reactor components (root window with a `SplitView` sidebar and the three pages). The widget's hand-written Win32 loop is untouched; the manager runs `App::run_component` on its own thread, launched from the tray, with a channel bridging later tray clicks to navigation. UI code is verified by building on Windows/CI; UI behaviour is verified manually on the developer's Windows machine.
+**Architecture:** New `src/manager.rs` holds a pure data layer (the Rust ports of `web.rs`'s API handlers, unit-tested) plus the reactor components (root window with a `SplitView` sidebar and the three pages). The widget's hand-written Win32 loop is untouched. **Process model (decided after the spike: `App::run_component` is one-shot per process):** the manager is a separate binary `claude-usage-manager.exe` (`src/bin/claude-usage-manager.rs`), launched by the tray with `--page <p>`; shared modules (`config`, `mcp`, `profile`, manager data layer) live in a new `src/lib.rs`. Widget -> manager data goes through `%APPDATA%\claude-usage-widget\usage-cache.json`; manager -> widget refresh goes through the named event `Local\ClaudeUsageWidgetRefresh`; a second launch navigates the running instance via a named mutex + event/file handoff. Wherever Tasks 1-6 below say `crate::REFRESH_TX`, `STATE`, `spawn_manager`, `MANAGER` or "own thread", read it as superseded by this model; Task 3 is rewritten accordingly. The updater (`update.rs`) must ship both executables (new Task 3b). UI code is verified by building on Windows/CI; UI behaviour is verified manually on the developer's Windows machine.
 
 **Tech Stack:** Rust 2021, `windows-reactor = "0.100"`, `windows-canvas = "0.100"` (reactor feature, Task 4 signature rings), existing `windows = 0.62` (widget, D2D, folder picker), `serde_json` (already). No other new dependencies.
 
@@ -36,8 +36,9 @@
 ### Task 1: Pure data layer (`src/manager.rs`)
 
 **Files:**
-- Create: `src/manager.rs`
-- Modify: `src/main.rs:3-8` (add `mod manager;`)
+- Create: `src/lib.rs` (`pub mod config; pub mod mcp; pub mod profile; pub mod manager;`), `src/manager.rs`
+- Modify: `src/main.rs` (drop `mod config/mcp/profile`, use them from the lib crate `claude_usage_widget`; `mod web` stays until Task 7), `Cargo.toml` (explicit lib + bins)
+- Refresh/usage changes vs. the text below: `refresh_widget()` signals the named event `Local\ClaudeUsageWidgetRefresh` instead of `REFRESH_TX`; `snapshot()` reads usage from `usage-cache.json` (written by the widget after each poll) instead of `main.rs::STATE`; tests inject a temp `APPDATA` and write the cache file.
 
 **Interfaces:**
 - Consumes: `config::{load, save, normalize, resolve_dir, Config, ProfileConfig}`, `mcp::{list, import, enabled, set_enabled, upsert, delete, Server}`, `profile::create` (all existing, unmodified).
@@ -100,46 +101,37 @@ git push
 
 ---
 
-### Task 3: Reactor dependency, manager window shell, tray wiring
+### Task 3: Manager executable shell, tray launch, single instance
 
 **Files:**
-- Modify: `Cargo.toml` (add `windows-reactor = "0.100"`; folder picker stays on `windows 0.62` → add feature `Win32_System_Com` alongside existing `Win32_UI_Shell`)
-- Modify: `src/main.rs` (`use` list, replace `open_page` at `main.rs:472`, tray `ID_PROFILES/ID_MCP/ID_CONFIG` arms at `main.rs:558-560`)
-- Modify: `src/manager.rs` (reactor components; held in the same module below Task 1's pure functions)
+- Modify: `Cargo.toml` (`windows-reactor = "0.100"`; add `[[bin]]` entries: `claude-usage-widget` -> `src/main.rs`, `claude-usage-manager` -> `src/bin/claude-usage-manager.rs`; `windows` features `Win32_System_Threading`, `Win32_System_Com` as needed)
+- Create: `src/bin/claude-usage-manager.rs` (reactor components, `ManagerRoot`, `Page`)
+- Modify: `src/main.rs` (replace `open_page` and the `ID_PROFILES/ID_MCP/ID_CONFIG` arms with `launch_manager(page)`; add the refresh-event listener thread; write `usage-cache.json` after each poll)
 
 **Interfaces:**
-- Consumes: Task 1's `ManagerState`, `refresh_widget` (`REFRESH_TX` already exists in `main.rs`).
-- Produces (used by Tasks 4–6 by exact name):
-  - `enum Page { Profiles, Mcp, Settings }` with `Page::label(self) -> &'static str` = "Profiles" / "MCP servers" / "Settings"
-  - `struct ManagerInput { first: Page, requests: std::sync::mpsc::Receiver<Page> }` — root component input
-  - Widget-side mailbox: `static MANAGER: std::sync::Mutex<Option<std::sync::mpsc::Sender<Page>>>` (`Sender<Page>` is `Send`; the `Mutex` makes the static `Sync`)
-  - `pub fn spawn_manager(first: Page)` — the only tray entry: try `send(first)` through the stored sender; if that fails (or there is none), create a fresh channel, store the new sender and spawn a std thread that calls `windows_reactor::App::run_component::<ManagerRoot>(ManagerInput { first, requests })`; if `run_component` itself returns `Err`, show one message box and remain tray-only (retryable from the tray any time)
-  - `impl Component for ManagerRoot { type Message = ManagerMsg; type Input = ManagerInput; }`:
-    - `enum ManagerMsg { Navigate(Page), Widget(Page), Profiles(ProfilesMsg), Mcp(McpMsg), Settings(SettingsMsg) }` — pages define their own `*Msg` enums in Tasks 4/5/6; the root wraps them
-    - Page-request pump (the only thread bridge; OS `std::sync::mpsc` types, never reactor types): in `create`, `context.spawn_background(move |_token| requests.recv().map(ManagerMsg::Widget).unwrap_or(ManagerMsg::Navigate(self.page)))`; in `update` on `ManagerMsg::Widget(p)` set `self.page = p` and spawn the next pump call. A channel that errors ends the pump; `run_component` returning ends the thread.
-    - Window title: "Usage Rings for Claude Code – Manager"
-    - View: `SplitView::new().open_pane_length(280.0).display_mode(SplitViewDisplayMode::CompactInline).is_pane_open(true)` with three sidebar buttons ("Profiles", "MCP servers", "Settings") wired via `context.message(ManagerMsg::Navigate(_))`, pane content = `View::component::<ProfilesPage | McpPage | SettingsPage>` selected by `self.page`, child input types defined in their tasks
-  - Init failure copy (`MessageBoxW`, shown on the manager thread where the pump errors): title "Usage Rings for Claude Code", text "Cannot open the manager window. The Windows App Runtime may be missing.", `MB_OK | MB_ICONERROR`; the tray items keep working.
+- `enum Page { Profiles, Mcp, Settings }`, `Page::label()` = "Profiles" / "MCP servers" / "Settings", `Page::arg()` = `profiles|mcp|settings`, `Page::parse(&str)`; shared via the lib so the widget uses the same `arg()`.
+- Widget side: `fn launch_manager(page: Page)` spawns `<dir of current_exe>\claude-usage-manager.exe --page <arg>`; spawn failure or missing exe -> `MessageBoxW` "Cannot start the manager (claude-usage-manager.exe not found next to the widget)." and stay tray-only, retryable.
+- Widget side: refresh listener thread waits on the named event `Local\ClaudeUsageWidgetRefresh` and does `REFRESH_TX.send(())`.
+- Widget side: after every successful/failed poll, write `usage-cache.json` (per-profile `name`, `session_used`, `weekly_used`, `weekly_reset`, `error`) atomically (write temp + rename).
+- Manager side: `main()` parses `--page`; takes named mutex `Local\ClaudeUsageManager`; if already held, writes the page to `manager-nav.txt` (APPDATA dir), sets the named event `Local\ClaudeUsageManagerNavigate`, focuses the existing window (`FindWindowW` by title) and exits 0. Otherwise runs `App::run_component::<ManagerRoot>(ManagerInput { first })` once; the page-request pump is `context.spawn_background` waiting on that event, reading `manager-nav.txt`, yielding `ManagerMsg::Widget(page)`. `run_component` returning means the process exits.
+- Window title "Usage Rings for Claude Code – Manager". View: `SplitView` sidebar (Profiles, MCP servers, Settings) + page content, per the UI/UX spec.
+- Init failure inside the manager process (runtime missing, WinUI error): `MessageBoxW` "Cannot open the manager window. The Windows App Runtime may be missing." and exit non-zero; the widget is unaffected.
 
-- [ ] **Step 1: Add Cargo deps.** `Cargo.toml`: `windows-reactor = "0.100"`; `windows.features += "Win32_System_Com"` (folder picker in Task 4; `Win32_UI_Shell` is already present). Keep `edition = "2021"` and `profile.release` as-is. `windows-numerics 0.3` stays; reactor brings its own `0.100` copy (both coexist).
-- [ ] **Step 2: Write the shell.** `ManagerRoot`, `spawn_manager` and the pump per the Interfaces block; tray arms change to `spawn_manager(Page::…)`, and `fn open_page` (`main.rs:472-479`) is deleted.
-- [ ] **Step 3: Verify the spike assumptions** — run on a Windows box (`cargo run --release`) or push and watch the Task 2 pipeline build; record what each check found in one line appended to the spec's "Builder check - answered" section in this task's commit:
-  1. `App::run_component` runs on a plain std thread inside the already-running widget process (widget tray stays responsive while the manager window is shown).
-  2. WinUI bootstrap: verify the `framework_dependent` sample needs no explicit init; if explicit bootstrap is required, add `windows-reactor-setup` per its README and surface its `Err` in the same message-box path.
-  3. Cross-thread navigation: second tray click switches page; only one window and one pump ever exist.
-- [ ] **Step 4: Build:** `cargo build --release --locked` → succeeds, no warnings; `cargo test` still green on the pipeline.
-- [ ] **Step 5: Manual verify** on the developer's Windows machine (Windows App Runtime installed):
-  - Each tray item opens the window on that page (first use).
-  - Second tray click while open → existing window comes to front and switches page; only one window at a time.
-  - Close on X → tray items keep working; clicking again opens a fresh view.
-  - Temporarily break runtime access (e.g. remove the Windows App Runtime install) → one message box, widget and other tray items unaffected, retriable next click.
-- [ ] **Step 6: Commit and push**
+- [ ] **Step 1: Cargo + lib split** (done in Task 1 for the lib; here add the reactor dep and bins).
+- [ ] **Step 2: Write the shell** per the interfaces above; tray arms call `launch_manager(Page::…)`; delete `open_page`.
+- [ ] **Step 3: Verify (Windows):** build green; each tray item opens the manager on that page; a second tray click while open switches page and focuses the same window (one process only); closing then clicking again starts a fresh process; killing/renaming the manager exe -> one message box, widget and other tray items unaffected; saving in the manager triggers a widget refresh within a second.
+- [ ] **Step 4: Commit and push** (`git add Cargo.toml Cargo.lock src docs`; "Add native manager executable shell and tray launch").
 
-```bash
-git add Cargo.toml Cargo.lock src/main.rs src/manager.rs
-git commit -m "Add native manager window shell and reactor dependency"
-git push
-```
+---
+
+### Task 3b: Updater ships both executables
+
+**Files:**
+- Modify: `src/update.rs`, `.github/workflows/release.yml`, `.github/workflows/test.yml` (if present from Task 2)
+
+- [ ] **Step 1:** `release.yml` Package step copies both `claude-usage-widget.exe` and `claude-usage-manager.exe` into the zip folder.
+- [ ] **Step 2:** `update.rs` extraction validates both exes exist in the package (error text names the missing one) and the swap script replaces both next to `current_exe()`. Keep the existing verify-then-swap behaviour; add a test for the "missing manager exe" case alongside the existing zip/sha tests.
+- [ ] **Step 3:** `cargo test update::` green; commit "Ship and update the manager executable with the widget".
 
 ---
 

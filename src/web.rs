@@ -244,3 +244,90 @@ fn save_config(body: &Value) -> Result<Value, String> {
     }
     Ok(json!({}))
 }
+
+/// Parity with the native manager: the same user actions through the web handlers and through
+/// `manager::*` must leave identical state on disk. Removed together with this file in Task 7.
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use claude_usage_widget::manager;
+
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn setup(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("parity-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for p in ["p1", "p2"] {
+            std::fs::create_dir_all(root.join(p)).unwrap();
+            std::fs::write(root.join(p).join(".claude.json"), "{}").unwrap();
+        }
+        std::env::set_var("APPDATA", root.join("appdata"));
+        let cfg = config::Config {
+            refresh_seconds: 900,
+            profiles: ["p1", "p2"]
+                .iter()
+                .map(|n| config::ProfileConfig {
+                    name: n.to_string(),
+                    command: None,
+                    config_dir: Some(root.join(n).display().to_string()),
+                })
+                .collect(),
+        };
+        config::save(&cfg).unwrap();
+        root
+    }
+
+    /// Everything a user could observe afterwards, with the temp root stripped out.
+    fn observe(root: &PathBuf) -> String {
+        let mut out = serde_json::to_string(&mcp::list()).unwrap();
+        for p in ["p1", "p2"] {
+            out += &std::fs::read_to_string(root.join(p).join(".claude.json")).unwrap();
+        }
+        out.replace(&root.display().to_string().replace('\\', "\\\\"), "<root>")
+    }
+
+    #[test]
+    fn manager_matches_web_handlers() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = setup("web");
+        save_server(&json!({"original": null, "server": {"name": "s", "type": "stdio", "command": "npx",
+            "args": ["-y", "@x/y"], "env": {"K": "v"}, "url": "", "headers": {}}})).unwrap();
+        save_server(&json!({"original": null, "server": {"name": "h", "type": "http", "command": "",
+            "args": [], "env": {}, "url": "https://x.test/mcp", "headers": {"A": "b"}}})).unwrap();
+        for (p, s, on) in [("p1", "s", true), ("p2", "h", true), ("p1", "h", true), ("p1", "h", false)] {
+            toggle(&json!({"profile": p, "server": s, "on": on})).unwrap();
+        }
+        save_server(&json!({"original": "s", "server": {"name": "s2", "type": "stdio", "command": "node",
+            "args": ["-y", "@x/y"], "env": {"K": "v"}, "url": "", "headers": {}}})).unwrap();
+        delete_server(&json!({"name": "h"})).unwrap();
+        let web_state = observe(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = setup("native");
+        manager::save_server(None, manager::build_server("s", "stdio", "npx", "-y\n@x/y", "K=v", "", "").unwrap()).unwrap();
+        manager::save_server(None, manager::build_server("h", "http", "", "", "", "https://x.test/mcp", "A=b").unwrap()).unwrap();
+        for (p, s, on) in [("p1", "s", true), ("p2", "h", true), ("p1", "h", true), ("p1", "h", false)] {
+            manager::toggle(p, s, on).unwrap();
+        }
+        manager::save_server(Some("s".into()), manager::build_server("s2", "stdio", "node", "-y\n@x/y", "K=v", "", "").unwrap()).unwrap();
+        manager::delete_server("h").unwrap();
+        let native_state = observe(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(web_state, native_state);
+        assert!(native_state.contains("s2") && !native_state.contains("\"h\""));
+    }
+
+    #[test]
+    fn manager_errors_match_web_handlers() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = setup("errs");
+        let web = toggle(&json!({"profile": "nope", "server": "s", "on": true})).unwrap_err();
+        assert_eq!(manager::toggle("nope", "s", true).unwrap_err(), web);
+        let web = save_server(&json!({"original": null, "server": {"name": "", "type": "stdio", "command": "x",
+            "args": [], "env": {}, "url": "", "headers": {}}})).unwrap_err();
+        let native = manager::save_server(None, manager::build_server("", "stdio", "x", "", "", "", "").unwrap()).unwrap_err();
+        assert_eq!(web, native);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

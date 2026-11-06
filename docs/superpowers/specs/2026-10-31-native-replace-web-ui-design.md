@@ -28,6 +28,7 @@ The widget's manager (Profiles, MCP servers, Settings) currently opens as HTML p
 - `windows-reactor` 0.100 is a **preview** crate and requires **rustc >= 1.95** (MSRV); `windows-pickers` for the folder picker. Verify the exact crate versions' MSRV when building; pin what the windows-rs samples of that era use.
 - Windows App Runtime must be installed on the dev/test machine (Windows 10+).
 - The existing app loop is hand-written Win32 (widget + tray in one thread). Reactor's `App` owns its own loop/thread model — run the manager as a reactor app on its own thread so the widget loop is untouched; verify reactor supports launching `App` on a non-main thread from an already-running process (sample reference: `notifyicon`, `secondary-window`, `navigation`). If a shared loop is required instead, that refactor is part of this project and the plan must spell it out.
+- **Spike result (2026-11-05, windows-reactor 0.100, rustc 1.99):** `App::run_component` opens a WinUI window fine on a plain secondary thread with no explicit bootstrap, but it is **one-shot per process**: after the window closes and `run_component` returns, a second call in the same process segfaults. So the in-process "restart the manager thread on each tray click" model is rejected. See "Process model" below.
 - Message pump/coexistence: window classes, DPI awareness and `windows_subsystem` from the existing `main.rs` must remain valid; the reactor window must not inherit the widget's layered/click-through styles.
 - Builds happen on Windows (MSVC); Rust code can be authored and syntax-checked elsewhere but not linked or run.
 
@@ -46,6 +47,16 @@ The widget's manager (Profiles, MCP servers, Settings) currently opens as HTML p
 ## Theme
 WinUI follows the system light/dark theme automatically. The web UI's per-page manual theme switcher (localStorage `theme`) has no equivalent need; it is dropped.
 
+## Process model (decided after the spike)
+The manager is a **separate executable**, `claude-usage-manager.exe`, shipped next to `claude-usage-widget.exe` in the same zip.
+- **Crate layout:** one package, a small `src/lib.rs` exposing the shared `config`, `mcp`, `profile` modules and the manager data layer; two binaries: `src/main.rs` (widget, unchanged Win32/D2D) and `src/bin/claude-usage-manager.rs` (reactor UI). The widget exe does not link reactor.
+- **Launch:** the tray runs `claude-usage-manager.exe --page profiles|mcp|settings`, located next to `current_exe()`. Missing exe or spawn failure: one message box, tray stays working, retryable.
+- **Single instance:** manager takes a named mutex. A second launch writes the requested page into a named event/file handoff, signals the running instance (which navigates) and brings its window to the front, then exits. Window closed = process exits; next click starts fresh (config re-read).
+- **Manager -> widget refresh:** after a save the manager signals a named event (`Local\ClaudeUsageWidgetRefresh`); the widget has a small thread that waits on it and sends on its existing `REFRESH_TX`. No port, no token, no HTTP.
+- **Widget -> manager usage data (rings in the manager):** the widget writes its latest per-profile readings to `%APPDATA%\claude-usage-widget\usage-cache.json` after every poll; the manager reads it on open. No reading or unreadable cache = empty track, never a made-up percent.
+- **Updater:** `update.rs` must now replace both executables (the zip contains both; the swap script copies both). A zip missing the manager exe is treated as invalid.
+- **Crash isolation:** a WinUI failure can only take down the manager process, never the widget.
+
 ## Decided structure
 - New `src/manager.rs` (component root + three page components + dialogs), reusing `config.rs`, `mcp.rs`, `profile.rs` directly. The data-shaping helpers from `web.rs` (`profile_dirs`, `state`, error strings) move there in Rust form.
 - Delete: `src/web.rs`, `profiles_ui.html`, `mcp_ui.html`, `settings_ui.html`, `ui_common.css`, `ui_common.js`, `mod web` and all browser-open code in `main.rs`.
@@ -55,6 +66,5 @@ WinUI follows the system light/dark theme automatically. The web UI's per-page m
 ## Left to the builder
 - Exact reactor component/layout code, dialog layout, spacing, and wording; match wording from the HTML pages.
 - Folder picker: prefer the `windows-pickers` crate; if it drags in the runtime setup separately, fall back to a `Win32_UI_Shell` folder dialog (the crate is already a dependency).
-- Threading model for "reactor App on its own thread" (verify against samples; document what was found in the README commit).
 - Cargo edits: add `windows-reactor` (and `windows-pickers` if used) with versions matching the repo samples; keep `edition`/`profile.release` as-is.
 - The text-area-per-line args parsing and kv-row add/remove interactions.
