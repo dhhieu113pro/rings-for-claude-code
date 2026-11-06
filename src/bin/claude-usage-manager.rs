@@ -91,7 +91,7 @@ impl Component for ManagerRoot {
         let content: View = match self.page {
             Page::Profiles => View::component::<ProfilesPage>(()),
             Page::Mcp => View::component::<McpPage>(()),
-            other => TextBlock::new().text(format!("{} (coming soon)", other.label())).into(),
+            Page::Settings => View::component::<SettingsPage>(()),
         };
         NavigationView::new()
             .pane_display_mode(NavigationViewPaneDisplayMode::Left)
@@ -835,6 +835,82 @@ impl McpPage {
     }
 }
 
+// ---------------------------------------------------------------- Settings page
+
+struct SettingsModel {
+    /// Text of the refresh box; parsed only on save.
+    seconds: String,
+    error: Option<String>,
+    saved: bool,
+}
+
+impl SettingsModel {
+    fn load() -> Self {
+        Self { seconds: config::load().refresh_seconds.to_string(), error: None, saved: false }
+    }
+
+    fn set_seconds(&mut self, text: String) {
+        self.seconds = text;
+        self.saved = false;
+    }
+
+    /// Parse failures and `save_settings` errors stay inline; nothing is written on error.
+    fn save(&mut self) {
+        self.saved = false;
+        match self.seconds.trim().parse::<u64>() {
+            Err(_) => self.error = Some("Enter a number of seconds.".into()),
+            Ok(n) => match manager::save_settings(n) {
+                Ok(()) => {
+                    self.error = None;
+                    self.saved = true;
+                }
+                Err(e) => self.error = Some(e),
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+enum SettingsMsg {
+    Seconds(String),
+    Save,
+}
+
+struct SettingsPage {
+    model: SettingsModel,
+}
+
+impl Component for SettingsPage {
+    type Input = ();
+    type Message = SettingsMsg;
+
+    fn create(_: &(), _: &ComponentContext<Self>) -> Self {
+        Self { model: SettingsModel::load() }
+    }
+
+    fn update(&mut self, message: SettingsMsg, _: &ComponentContext<Self>) {
+        match message {
+            SettingsMsg::Seconds(t) => self.model.set_seconds(t),
+            SettingsMsg::Save => self.model.save(),
+        }
+    }
+
+    fn view(&self, _: &(), context: &mut ViewContext<Self>) -> View {
+        let m = &self.model;
+        let status = match (&m.error, m.saved) {
+            (Some(e), _) => e.clone(),
+            (None, true) => "Saved.".to_string(),
+            _ => String::new(),
+        };
+        StackPanel::new().spacing(8.0).children((
+            TextBlock::new().text("Refresh interval (seconds)"),
+            TextBox::new().text(m.seconds.clone()).on_text_changed(context.callback(SettingsMsg::Seconds)),
+            Button::new().on_click(context.message(SettingsMsg::Save)).content("Save"),
+            TextBlock::new().text(status),
+        ))
+    }
+}
+
 fn focus_window() {
     unsafe {
         if let Ok(hwnd) = FindWindowW(None, &HSTRING::from(TITLE)) {
@@ -1149,6 +1225,26 @@ mod tests {
         let out = render::<McpPage>(());
         assert!(out.contains("srv  [stdio]") && out.contains("npx -y"), "{out}");
         assert!(out.contains("+ Add server") && out.contains("Import"), "{out}");
+    }
+
+    #[test]
+    fn settings_prefill_validate_and_save() {
+        let (_g, _root) = env("settings", &["a"]);
+        let mut m = SettingsModel::load();
+        assert_eq!(m.seconds, "900");
+        m.set_seconds("abc".into());
+        m.save();
+        assert_eq!(m.error.as_deref(), Some("Enter a number of seconds."));
+        m.set_seconds("5".into());
+        m.save();
+        assert!(m.error.as_deref().unwrap_or("").contains("15"), "{:?}", m.error);
+        assert!(!m.saved);
+        assert_eq!(config::load().refresh_seconds, 900, "nothing persisted on error");
+        m.set_seconds(" 42 ".into());
+        m.save();
+        assert!(m.saved && m.error.is_none());
+        assert_eq!(config::load().refresh_seconds, 42);
+        assert!(render::<SettingsPage>(()).contains("Refresh interval (seconds)"));
     }
 
     #[test]
