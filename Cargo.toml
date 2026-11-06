@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 windows-numerics = "0.3"
 windows-reactor = "0.100"
+windows-canvas = { version = "0.100", features = ["reactor"] }
 
 [dependencies.windows]
 version = "0.62"

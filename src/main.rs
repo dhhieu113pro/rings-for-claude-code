@@ -128,13 +128,8 @@ fn rgba(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
 
 /// Colour by percent used: red above 90%, orange above 60%, otherwise green.
 fn level_color(used: f32) -> D2D1_COLOR_F {
-    if used > 90.0 {
-        rgba(0.92, 0.33, 0.33, 1.0)
-    } else if used > 60.0 {
-        rgba(0.98, 0.58, 0.16, 1.0)
-    } else {
-        rgba(0.30, 0.78, 0.45, 1.0)
-    }
+    let (r, g, b) = manager::level_rgb(used);
+    rgba(r, g, b, 1.0)
 }
 
 fn make_format(dw: &IDWriteFactory, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {

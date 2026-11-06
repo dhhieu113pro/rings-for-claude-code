@@ -30,6 +30,18 @@ pub fn refresh_widget() {
     }
 }
 
+/// Ring colour by percent used: red above 90%, orange above 60%, otherwise green.
+/// The widget and the manager both use this, so the thresholds live in one place.
+pub fn level_rgb(used: f32) -> (f32, f32, f32) {
+    if used > 90.0 {
+        (0.92, 0.33, 0.33)
+    } else if used > 60.0 {
+        (0.98, 0.58, 0.16)
+    } else {
+        (0.30, 0.78, 0.45)
+    }
+}
+
 /// Manager pages; `arg()` is what the tray passes as `--page`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
@@ -432,6 +444,14 @@ mod tests {
         let _env = Env::new("newprofile");
         let e = new_profile("../evil", &[]).err().unwrap();
         assert!(e.contains("name may only use"), "{e}");
+    }
+
+    #[test]
+    fn level_thresholds() {
+        assert_eq!(level_rgb(0.0), level_rgb(60.0));
+        assert_ne!(level_rgb(60.0), level_rgb(60.1));
+        assert_eq!(level_rgb(60.1), level_rgb(90.0));
+        assert_ne!(level_rgb(90.0), level_rgb(90.1));
     }
 
     #[test]

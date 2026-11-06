@@ -109,6 +109,48 @@ impl Component for ManagerRoot {
 
 // ---------------------------------------------------------------- Profiles page
 
+const RING_SIZE: f64 = 36.0;
+const RING_STROKE: f32 = 4.0;
+
+/// Points along an arc that starts at 12 o'clock and runs clockwise for `fraction` of a turn.
+fn arc_points(cx: f32, cy: f32, r: f32, fraction: f32) -> Vec<(f32, f32)> {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let steps = ((fraction * 120.0).ceil() as usize).max(1);
+    (0..=steps)
+        .map(|i| {
+            let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * fraction * i as f32 / steps as f32;
+            (cx + r * a.cos(), cy + r * a.sin())
+        })
+        .collect()
+}
+
+/// A ring showing a real reading, or only the empty track when there is none.
+fn ring_meter(used: Option<f32>) -> View {
+    let canvas = windows_canvas::canvas(move |dc| {
+        let (cx, cy) = (dc.width / 2.0, dc.height / 2.0);
+        let r = (dc.width.min(dc.height) - RING_STROKE) / 2.0;
+        let track = dc.create_solid_brush(windows_canvas::ColorF::new(0.5, 0.5, 0.5, 0.25))?;
+        dc.draw_ellipse(&windows_canvas::Ellipse::new(windows_canvas::Vector2::new(cx, cy), r, r), &track, RING_STROKE);
+        if let Some(u) = used.map(|u| u.clamp(0.0, 100.0)).filter(|u| *u > 0.0) {
+            let (red, green, blue) = manager::level_rgb(u);
+            let brush = dc.create_solid_brush(windows_canvas::ColorF::new(red, green, blue, 1.0))?;
+            let style = dc.device().create_stroke_style(
+                &windows_canvas::StrokeStyleBuilder::new().caps(windows_canvas::CapStyle::Round),
+            )?;
+            let pts = arc_points(cx, cy, r, u / 100.0);
+            let mut figure = windows_canvas::PathBuilder::new(dc.device())?
+                .begin_hollow(windows_canvas::Vector2::new(pts[0].0, pts[0].1));
+            for p in &pts[1..] {
+                figure = figure.line_to(windows_canvas::Vector2::new(p.0, p.1));
+            }
+            let path = figure.end_open().build()?;
+            dc.draw_path_styled(&path, &brush, RING_STROKE, &style);
+        }
+        Ok(())
+    });
+    Grid::new().width(RING_SIZE).height(RING_SIZE).children((canvas,))
+}
+
 fn percent_text(used: Option<f32>) -> String {
     // A ring shows a real reading or nothing, never a made-up number.
     used.map(|u| format!("{:.0}%", u.clamp(0.0, 100.0))).unwrap_or_else(|| "\u{2014}".into())
@@ -327,7 +369,11 @@ impl Component for ProfilesPage {
                 let card = StackPanel::new().spacing(4.0).children((
                     TextBlock::new().text(p.name.clone()),
                     TextBlock::new().text(p.dir.clone()),
-                    TextBlock::new().text(usage),
+                    StackPanel::new().spacing(12.0).orientation(Orientation::Horizontal).children((
+                        ring_meter(p.session_used),
+                        ring_meter(p.weekly_used),
+                        TextBlock::new().text(usage),
+                    )),
                     TextBlock::new().text(mcps),
                     TextBlock::new().text(p.error.clone().unwrap_or_default()),
                     StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
@@ -637,6 +683,16 @@ mod tests {
         pump.dispatch_components(16).unwrap();
         let out = format!("{:?}", pump.runtime().commands());
         assert!(out.contains("+ New profile") && out.contains("Remove"), "{out}");
+    }
+
+    #[test]
+    fn arcs_start_at_twelve_and_run_clockwise() {
+        let pts = arc_points(50.0, 50.0, 10.0, 0.25);
+        let (x0, y0) = pts[0];
+        assert!((x0 - 50.0).abs() < 1e-3 && (y0 - 40.0).abs() < 1e-3, "starts at the top: {x0},{y0}");
+        let (x1, y1) = *pts.last().unwrap();
+        assert!((x1 - 60.0).abs() < 1e-3 && (y1 - 50.0).abs() < 1e-3, "quarter turn ends at 3 o'clock: {x1},{y1}");
+        assert_eq!(arc_points(0.0, 0.0, 5.0, 2.0).len(), arc_points(0.0, 0.0, 5.0, 1.0).len(), "clamped to a full turn");
     }
 
     #[test]

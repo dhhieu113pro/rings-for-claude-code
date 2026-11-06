@@ -9,6 +9,7 @@ dependencies = [
  "serde",
  "serde_json",
  "windows",
+ "windows-canvas",
  "windows-numerics 0.3.1",
  "windows-reactor",
 ]
@@ -160,6 +161,18 @@ dependencies = [
  "windows-core 0.62.2",
  "windows-future 0.3.2",
  "windows-numerics 0.3.1",
+]
+
+[[package]]
+name = "windows-canvas"
+version = "0.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6bc3a83c76a8113ab82864086778b6a705b4b54700ed84d642a1b1125987bef"
+dependencies = [
+ "windows-core 0.100.0",
+ "windows-numerics 0.100.0",
+ "windows-reactor",
+ "windows-window",
 ]
 
 [[package]]
@@ -364,6 +377,15 @@ name = "windows-time"
 version = "0.100.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de136aac4d76b9ea94b2589774be8bcd91b31b2dd7dae54abdd63335590095e4"
+dependencies = [
+ "windows-core 0.100.0",
+]
+
+[[package]]
+name = "windows-window"
+version = "0.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1d48f56961ae40c65db3a0ea0076a0b100f4c46ba21d78af97bd8b77e924a82"
 dependencies = [
  "windows-core 0.100.0",
 ]
