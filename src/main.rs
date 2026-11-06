@@ -1,10 +1,9 @@
 #![windows_subsystem = "windows"]
 
 use claude_usage_widget::manager::{self, Page};
-use claude_usage_widget::{config, mcp, profile};
+use claude_usage_widget::config;
 mod update;
 mod usage;
-mod web;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};

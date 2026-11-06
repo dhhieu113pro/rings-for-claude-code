@@ -49,7 +49,7 @@ Claude Code handles authentication and token refresh itself, so the widget never
 
 ## Configuration
 
-The tray menu opens a local manager in the browser (`127.0.0.1`, random port and token, only while the widget runs) with three pages: **Profiles**, **MCP servers** and **Settings**.
+The tray menu opens the native manager window (`claude-usage-manager.exe`, next to the widget) with three pages: **Profiles**, **MCP servers** and **Settings**. Clicking a tray item while the window is open switches it to that page.
 
 - **Profiles** lists the profiles shown in the widget with their folder, launcher command and enabled MCP servers. Edit changes the name, launcher command or config folder; Remove only hides a profile in the widget (its files are kept); *Add existing…* shows an existing config folder; *New profile* creates one (see below).
 - **Settings** sets the refresh interval.
@@ -90,12 +90,11 @@ Tray menu → **MCP servers** (or the *MCP servers* page of the manager) lets yo
 - Editing or renaming a server updates it in every profile that has it on; deleting removes it from all of them.
 - **Import** copies the servers already in a profile's `.claude.json` into the shared list (names already in the list are skipped). Keys the UI does not edit, such as `tools`, are kept; entries with a type other than `stdio`/`http` are skipped.
 - **New profile** (on the Profiles page) does what `new-claude-profile.bat` does: it creates `%USERPROFILE%\claude-profiles\<name>` with a default `settings.json`, writes the launcher `%USERPROFILE%\.local\bin\<name>.cmd` (sets `CLAUDE_CONFIG_DIR`, runs `claude.exe`), adds the profile to the widget, and turns on the shared MCP servers you tick. Existing folders, `settings.json` and launchers are kept. `claude.exe` is looked up in `CLAUDE_EXE`, `%USERPROFILE%\.local\bin`, then `PATH`; `CLAUDE_PROFILE_ROOT` and `CLAUDE_BIN_DIR` override the folders. Servers that run through `dnx` are plain `stdio` servers with command `dnx`.
-- Every page has a theme icon (system, sun, moon) for **Auto / Light / Dark**; the choice is remembered in the browser.
 - Env values are stored in plain text in both files, as Claude Code does itself. Restart running Claude sessions to pick up changes.
 
 ## Build and run
 
-Requires the Rust MSVC toolchain.
+Requires the Rust MSVC toolchain. The manager window is a WinUI 3 app, so running it needs the [Windows App Runtime](https://learn.microsoft.com/en-us/windows/apps/windows-app-sdk/) (the widget itself works without it).
 
 ```powershell
 cargo build --release
@@ -123,11 +122,12 @@ Tray menu → **Check for updates**. If a newer GitHub release exists, you are a
 
 ## Project layout
 
-- `src/main.rs` – window, layered rendering, tray menu, polling thread
+- `src/main.rs` – widget: window, layered rendering, tray menu, polling thread
+- `src/bin/claude-usage-manager.rs` – native manager window (Profiles, MCP servers, Settings pages)
+- `src/manager.rs` – the manager's data layer (shared by the UI and its tests), widget hand-off via named event and `usage-cache.json`
+- `src/lib.rs` – modules shared by both executables
 - `src/config.rs` – config file, profile directory resolution
 - `src/update.rs` – check for updates: GitHub release lookup, SHA-256 verify, replace helper
 - `src/usage.rs` – runs `claude -p "/usage"` and parses it
 - `src/profile.rs` – creates a profile (folder, launcher, widget entry)
 - `src/mcp.rs` – central MCP list, sync into profile `.claude.json`
-- `src/web.rs` – localhost server for the manager UI
-- `src/profiles_ui.html`, `src/mcp_ui.html`, `src/settings_ui.html`, `src/ui_common.css`, `src/ui_common.js` – the manager pages and shared styles/helpers
