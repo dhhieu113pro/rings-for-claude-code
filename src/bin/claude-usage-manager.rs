@@ -2,7 +2,7 @@
 //! Native manager window. One process, one window: a second launch hands its page to the
 //! running instance (named mutex + event + `manager-nav.txt`) and exits.
 use claude_usage_widget::config;
-use claude_usage_widget::manager::{self, ManagerState, Page};
+use claude_usage_widget::manager::{self, ManagerState, Page, ProfileCard};
 use std::path::PathBuf;
 use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, WAIT_OBJECT_0};
@@ -90,6 +90,7 @@ impl Component for ManagerRoot {
         });
         let content: View = match self.page {
             Page::Profiles => View::component::<ProfilesPage>(()),
+            Page::Mcp => View::component::<McpPage>(()),
             other => TextBlock::new().text(format!("{} (coming soon)", other.label())).into(),
         };
         NavigationView::new()
@@ -477,6 +478,363 @@ impl ProfilesPage {
     }
 }
 
+// ---------------------------------------------------------------- MCP servers page
+
+#[derive(Clone, PartialEq, Debug, Default)]
+struct ServerForm {
+    /// `None` when adding a new server.
+    original: Option<String>,
+    name: String,
+    /// `stdio` or `http`.
+    kind: String,
+    command: String,
+    args: String,
+    env: String,
+    url: String,
+    headers: String,
+}
+
+impl ServerForm {
+    fn blank() -> Self {
+        Self { kind: "stdio".into(), ..Self::default() }
+    }
+
+    /// Rows are pre-filled with the exact strings the parsers read back.
+    fn from_server(s: &claude_usage_widget::mcp::Server) -> Self {
+        let kv = |m: &std::collections::BTreeMap<String, String>| {
+            m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n")
+        };
+        Self {
+            original: Some(s.name.clone()),
+            name: s.name.clone(),
+            kind: s.kind.clone(),
+            command: s.command.clone(),
+            args: s.args.join("\n"),
+            env: kv(&s.env),
+            url: s.url.clone(),
+            headers: kv(&s.headers),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum McpDialog {
+    None,
+    Form(ServerForm),
+    ConfirmDelete(String),
+}
+
+#[derive(Clone, Copy)]
+enum ServerField {
+    Name,
+    Command,
+    Args,
+    Env,
+    Url,
+    Headers,
+}
+
+struct McpModel {
+    state: ManagerState,
+    dialog: McpDialog,
+    /// Index into `state.profiles` for the Import dropdown.
+    import_from: usize,
+    /// Inline error (in the open dialog, otherwise on the page).
+    error: Option<String>,
+    /// "Imported: a, b" / "Nothing to import".
+    notice: Option<String>,
+}
+
+impl McpModel {
+    fn load() -> Self {
+        Self { state: manager::snapshot(), dialog: McpDialog::None, import_from: 0, error: None, notice: None }
+    }
+
+    fn reload(&mut self) {
+        self.state = manager::snapshot();
+        self.import_from = self.import_from.min(self.state.profiles.len().saturating_sub(1));
+    }
+
+    /// A checkbox is on only for a readable profile that lists the server.
+    fn is_enabled(&self, profile: &ProfileCard, server: &str) -> bool {
+        profile.error.is_none() && profile.mcps.iter().any(|m| m == server)
+    }
+
+    fn toggle(&mut self, profile: &str, server: &str, on: bool) {
+        self.notice = None;
+        match manager::toggle(profile, server, on) {
+            Ok(()) => self.error = None,
+            Err(e) => self.error = Some(e),
+        }
+        self.reload();
+    }
+
+    fn open_add(&mut self) {
+        self.error = None;
+        self.dialog = McpDialog::Form(ServerForm::blank());
+    }
+
+    fn open_edit(&mut self, name: &str) {
+        self.error = None;
+        match self.state.servers.iter().find(|s| s.name == name) {
+            Some(s) => self.dialog = McpDialog::Form(ServerForm::from_server(s)),
+            None => self.error = Some("unknown server".into()),
+        }
+    }
+
+    fn set_kind(&mut self, kind: &str) {
+        if let McpDialog::Form(f) = &mut self.dialog {
+            f.kind = kind.to_string();
+        }
+    }
+
+    fn set_field(&mut self, field: ServerField, text: String) {
+        if let McpDialog::Form(f) = &mut self.dialog {
+            match field {
+                ServerField::Name => f.name = text,
+                ServerField::Command => f.command = text,
+                ServerField::Args => f.args = text,
+                ServerField::Env => f.env = text,
+                ServerField::Url => f.url = text,
+                ServerField::Headers => f.headers = text,
+            }
+        }
+    }
+
+    /// Builds via `manager::build_server` so parsing and carried-over extras stay single-sourced.
+    fn submit_form(&mut self) {
+        let McpDialog::Form(f) = &self.dialog else { return };
+        let result = manager::build_server(&f.name, &f.kind, &f.command, &f.args, &f.env, &f.url, &f.headers)
+            .and_then(|server| manager::save_server(f.original.clone(), server));
+        match result {
+            Ok(()) => {
+                self.dialog = McpDialog::None;
+                self.error = None;
+                self.reload();
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn ask_delete(&mut self, name: String) {
+        self.error = None;
+        self.dialog = McpDialog::ConfirmDelete(name);
+    }
+
+    fn confirm_delete(&mut self) {
+        let McpDialog::ConfirmDelete(name) = &self.dialog else { return };
+        if let Err(e) = manager::delete_server(name) {
+            self.error = Some(e);
+        }
+        self.dialog = McpDialog::None;
+        self.reload();
+    }
+
+    fn import(&mut self) {
+        let Some(p) = self.state.profiles.get(self.import_from) else {
+            self.error = Some("No profiles to import from.".into());
+            return;
+        };
+        match manager::import_from(&p.name.clone()) {
+            Ok(added) if added.is_empty() => {
+                self.error = None;
+                self.notice = Some("Nothing to import".into());
+            }
+            Ok(added) => {
+                self.error = None;
+                self.notice = Some(format!("Imported: {}", added.join(", ")));
+            }
+            Err(e) => {
+                self.notice = None;
+                self.error = Some(e);
+            }
+        }
+        self.reload();
+    }
+
+    fn dismiss(&mut self) {
+        self.dialog = McpDialog::None;
+        self.error = None;
+    }
+}
+
+#[derive(Clone)]
+enum McpMsg {
+    Toggle(String, String, bool),
+    Add,
+    Edit(String),
+    Delete(String),
+    Kind(String),
+    Field(ServerField, String),
+    ImportFrom(Option<usize>),
+    Import,
+    Closed(ContentDialogResult),
+}
+
+struct McpPage {
+    model: McpModel,
+}
+
+impl Component for McpPage {
+    type Input = ();
+    type Message = McpMsg;
+
+    fn create(_: &(), _: &ComponentContext<Self>) -> Self {
+        Self { model: McpModel::load() }
+    }
+
+    fn update(&mut self, message: McpMsg, _: &ComponentContext<Self>) {
+        let m = &mut self.model;
+        match message {
+            McpMsg::Toggle(p, s, on) => m.toggle(&p, &s, on),
+            McpMsg::Add => m.open_add(),
+            McpMsg::Edit(n) => m.open_edit(&n),
+            McpMsg::Delete(n) => m.ask_delete(n),
+            McpMsg::Kind(k) => m.set_kind(&k),
+            McpMsg::Field(f, t) => m.set_field(f, t),
+            McpMsg::ImportFrom(i) => m.import_from = i.unwrap_or(0),
+            McpMsg::Import => m.import(),
+            McpMsg::Closed(result) => {
+                let primary = result == ContentDialogResult::Primary;
+                match (&m.dialog, primary) {
+                    (McpDialog::Form(_), true) => m.submit_form(),
+                    (McpDialog::ConfirmDelete(_), true) => m.confirm_delete(),
+                    _ => m.dismiss(),
+                }
+            }
+        }
+    }
+
+    fn view(&self, _: &(), context: &mut ViewContext<Self>) -> View {
+        let m = &self.model;
+        let cards: Vec<KeyedView> = m
+            .state
+            .servers
+            .iter()
+            .map(|s| {
+                let summary = if s.kind == "http" {
+                    s.url.clone()
+                } else {
+                    std::iter::once(s.command.as_str()).chain(s.args.iter().map(String::as_str)).collect::<Vec<_>>().join(" ")
+                };
+                let boxes: Vec<KeyedView> = m
+                    .state
+                    .profiles
+                    .iter()
+                    .map(|p| {
+                        let (pn, sn) = (p.name.clone(), s.name.clone());
+                        let check = CheckBox::new()
+                            .is_checked(m.is_enabled(p, &s.name))
+                            .is_enabled(p.error.is_none())
+                            .on_is_checked_changed(context.callback(move |on| McpMsg::Toggle(pn.clone(), sn.clone(), on)))
+                            .content(p.name.clone());
+                        let view: View = match &p.error {
+                            Some(e) => check.tooltip(e.clone()),
+                            None => check,
+                        };
+                        KeyedView::new(p.name.clone(), view)
+                    })
+                    .collect();
+                let card = StackPanel::new().spacing(4.0).children((
+                    TextBlock::new().text(format!("{}  [{}]", s.name, s.kind)),
+                    TextBlock::new().text(summary.clone()).tooltip(summary),
+                    StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).keyed_children(boxes),
+                    StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
+                        Button::new().on_click(context.message(McpMsg::Edit(s.name.clone()))).content("Edit"),
+                        Button::new().on_click(context.message(McpMsg::Delete(s.name.clone()))).content("Delete"),
+                    )),
+                ));
+                KeyedView::new(s.name.clone(), card)
+            })
+            .collect();
+        let list: View = if cards.is_empty() {
+            TextBlock::new().text("No MCP servers yet.").into()
+        } else {
+            StackPanel::new().spacing(12.0).keyed_children(cards)
+        };
+        let warnings: Vec<KeyedView> = m
+            .state
+            .profiles
+            .iter()
+            .filter_map(|p| p.error.as_ref().map(|e| KeyedView::new(p.name.clone(), TextBlock::new().text(format!("{}: {e}", p.name)))))
+            .collect();
+        let names: Vec<String> = m.state.profiles.iter().map(|p| p.name.clone()).collect();
+        let page_error = if m.dialog == McpDialog::None { m.error.clone().unwrap_or_default() } else { String::new() };
+
+        StackPanel::new().spacing(12.0).children((
+            StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
+                Button::new().on_click(context.message(McpMsg::Add)).content("+ Add server"),
+                TextBlock::new().text("Import from"),
+                ComboBox::new()
+                    .items_source(names)
+                    .selected_index(if m.state.profiles.is_empty() { None } else { Some(m.import_from) })
+                    .on_selection_changed(context.callback(McpMsg::ImportFrom)),
+                Button::new().on_click(context.message(McpMsg::Import)).content("Import"),
+            )),
+            TextBlock::new().text(m.notice.clone().unwrap_or_default()),
+            TextBlock::new().text(page_error),
+            list,
+            StackPanel::new().spacing(4.0).keyed_children(warnings),
+            self.dialog_view(context),
+        ))
+    }
+}
+
+impl McpPage {
+    fn dialog_view(&self, context: &mut ViewContext<Self>) -> View {
+        let m = &self.model;
+        let on_closed = context.callback(McpMsg::Closed);
+        let error = m.error.clone().unwrap_or_default();
+        match &m.dialog {
+            McpDialog::None => ContentDialog::new().is_open(false).title("").content(TextBlock::new()),
+            McpDialog::ConfirmDelete(name) => ContentDialog::new()
+                .is_open(true)
+                .title(format!("Delete \"{name}\"?"))
+                .primary_button_text("Delete")
+                .close_button_text("Cancel")
+                .on_closed(on_closed)
+                .content(TextBlock::new().text("Delete this server and remove it from every profile?")),
+            McpDialog::Form(f) => {
+                let text = |value: &str, placeholder: &str, field: ServerField| {
+                    TextBox::new()
+                        .text(value.to_string())
+                        .placeholder_text(placeholder)
+                        .accepts_return(true)
+                        .on_text_changed(context.callback(move |t| McpMsg::Field(field, t)))
+                };
+                let fields: View = if f.kind == "http" {
+                    StackPanel::new().spacing(8.0).children((
+                        text(&f.url, "URL", ServerField::Url),
+                        text(&f.headers, "Headers (one Name=Value per line)", ServerField::Headers),
+                    ))
+                } else {
+                    StackPanel::new().spacing(8.0).children((
+                        text(&f.command, "Command", ServerField::Command),
+                        text(&f.args, "Arguments (one per line)", ServerField::Args),
+                        text(&f.env, "Environment (one NAME=value per line)", ServerField::Env),
+                    ))
+                };
+                ContentDialog::new()
+                    .is_open(true)
+                    .title(if f.original.is_some() { "Edit server" } else { "Add server" })
+                    .primary_button_text("Save")
+                    .close_button_text("Cancel")
+                    .on_closed(on_closed)
+                    .content(StackPanel::new().spacing(8.0).children((
+                        text(&f.name, "Name", ServerField::Name),
+                        StackPanel::new().spacing(8.0).orientation(Orientation::Horizontal).children((
+                            Button::new().on_click(context.message(McpMsg::Kind("stdio".into()))).content("stdio"),
+                            Button::new().on_click(context.message(McpMsg::Kind("http".into()))).content("http"),
+                            TextBlock::new().text(format!("Type: {}", f.kind)),
+                        )),
+                        fields,
+                        TextBlock::new().text(error),
+                    )))
+            }
+        }
+    }
+}
+
 fn focus_window() {
     unsafe {
         if let Ok(hwnd) = FindWindowW(None, &HSTRING::from(TITLE)) {
@@ -683,6 +1041,114 @@ mod tests {
         pump.dispatch_components(16).unwrap();
         let out = format!("{:?}", pump.runtime().commands());
         assert!(out.contains("+ New profile") && out.contains("Remove"), "{out}");
+    }
+
+    fn add_server(m: &mut McpModel, name: &str, command: &str, args: &str, env: &str) {
+        m.open_add();
+        m.set_field(ServerField::Name, name.into());
+        m.set_field(ServerField::Command, command.into());
+        m.set_field(ServerField::Args, args.into());
+        m.set_field(ServerField::Env, env.into());
+        m.submit_form();
+    }
+
+    fn claude_json(root: &PathBuf, profile: &str) -> String {
+        std::fs::read_to_string(root.join(profile).join(".claude.json")).unwrap()
+    }
+
+    #[test]
+    fn mcp_add_toggle_edit_delete_round_trip() {
+        let (_g, root) = env("mcpflow", &["a", "b"]);
+        let mut m = McpModel::load();
+        add_server(&mut m, "s", "npx", "-y\n@x/y", "K=v");
+        assert_eq!(m.dialog, McpDialog::None, "{:?}", m.error);
+        assert_eq!(m.state.servers.len(), 1);
+        assert!(!m.is_enabled(&m.state.profiles[0], "s"));
+
+        m.toggle("a", "s", true);
+        assert!(m.is_enabled(&m.state.profiles[0], "s") && !m.is_enabled(&m.state.profiles[1], "s"));
+        assert!(claude_json(&root, "a").contains("\"s\""));
+        assert!(!claude_json(&root, "b").contains("\"s\""));
+
+        // Rename keeps the server enabled where it was; the form pre-fills with what the parsers read.
+        m.open_edit("s");
+        match &m.dialog {
+            McpDialog::Form(f) => assert_eq!((f.args.as_str(), f.env.as_str()), ("-y\n@x/y", "K=v")),
+            other => panic!("{other:?}"),
+        }
+        m.set_field(ServerField::Name, "s2".into());
+        m.submit_form();
+        assert_eq!(m.dialog, McpDialog::None, "{:?}", m.error);
+        assert!(m.is_enabled(&m.state.profiles[0], "s2"));
+        assert!(!claude_json(&root, "a").contains("\"s\""));
+
+        m.toggle("a", "s2", false);
+        assert!(!claude_json(&root, "a").contains("s2"));
+
+        m.ask_delete("s2".into());
+        m.dismiss();
+        assert_eq!(m.state.servers.len(), 1, "cancel keeps it");
+        m.ask_delete("s2".into());
+        m.confirm_delete();
+        assert!(m.state.servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_form_errors_stay_inline() {
+        let (_g, _root) = env("mcperr", &["a"]);
+        let mut m = McpModel::load();
+        add_server(&mut m, "", "npx", "", "");
+        assert!(matches!(m.dialog, McpDialog::Form(_)));
+        assert!(m.error.is_some());
+        m.set_field(ServerField::Name, "ok".into());
+        m.set_field(ServerField::Env, "no-equals-sign".into());
+        m.submit_form();
+        assert!(matches!(m.dialog, McpDialog::Form(_)), "bad env line keeps the dialog open");
+        assert!(m.error.is_some());
+        assert!(manager::snapshot().servers.is_empty(), "nothing written");
+    }
+
+    #[test]
+    fn mcp_broken_profile_is_disabled_and_untouched() {
+        let (_g, root) = env("mcpbroken", &["a", "b"]);
+        let mut m = McpModel::load();
+        add_server(&mut m, "s", "npx", "", "");
+        std::fs::write(root.join("a").join(".claude.json"), "{ not json").unwrap();
+        m.reload();
+        assert!(m.state.profiles[0].error.is_some());
+        assert!(!m.is_enabled(&m.state.profiles[0], "s"));
+        m.toggle("a", "s", true);
+        assert!(m.error.is_some(), "the read error surfaces inline");
+        assert_eq!(claude_json(&root, "a"), "{ not json", "file untouched");
+        let out = render::<McpPage>(());
+        assert!(out.contains("a: "), "warning card for the broken profile: {out}");
+    }
+
+    #[test]
+    fn mcp_import_reports_names_then_nothing() {
+        let (_g, root) = env("mcpimport", &["a"]);
+        std::fs::write(
+            root.join("a").join(".claude.json"),
+            r#"{"mcpServers":{"imp":{"type":"stdio","command":"npx","args":[]}}}"#,
+        )
+        .unwrap();
+        let mut m = McpModel::load();
+        m.import();
+        assert_eq!(m.notice.as_deref(), Some("Imported: imp"), "{:?}", m.error);
+        assert!(m.state.servers.iter().any(|s| s.name == "imp"));
+        m.import();
+        assert_eq!(m.notice.as_deref(), Some("Nothing to import"));
+    }
+
+    #[test]
+    fn mcp_page_renders_matrix_and_empty_state() {
+        let (_g, _root) = env("mcprender", &["a", "b"]);
+        assert!(render::<McpPage>(()).contains("No MCP servers yet."));
+        let mut m = McpModel::load();
+        add_server(&mut m, "srv", "npx", "-y", "");
+        let out = render::<McpPage>(());
+        assert!(out.contains("srv  [stdio]") && out.contains("npx -y"), "{out}");
+        assert!(out.contains("+ Add server") && out.contains("Import"), "{out}");
     }
 
     #[test]
