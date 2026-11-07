@@ -16,7 +16,14 @@ pub struct ProfileConfig {
 pub struct Config {
     #[serde(default = "default_refresh")]
     pub refresh_seconds: u64,
+    /// Manager window theme: `system` (default), `light` or `dark`.
+    #[serde(default = "default_theme")]
+    pub theme: String,
     pub profiles: Vec<ProfileConfig>,
+}
+
+fn default_theme() -> String {
+    "system".into()
 }
 
 fn default_refresh() -> u64 {
@@ -32,6 +39,7 @@ impl Default for Config {
         };
         Config {
             refresh_seconds: default_refresh(),
+            theme: default_theme(),
             profiles: vec![p("main", Some("claude"), None)],
         }
     }
@@ -97,10 +105,19 @@ pub fn resolve_dir(p: &ProfileConfig) -> PathBuf {
     home().join(".claude")
 }
 
+/// The one rule for the poll interval, shared by saving and by the Settings page's live hint.
+pub fn validate_refresh(seconds: u64) -> Result<(), String> {
+    if seconds < 15 {
+        return Err("refresh must be at least 15 seconds".into());
+    }
+    Ok(())
+}
+
 /// Trims fields, turns blank optional ones into `None` and checks the result is usable.
 pub fn normalize(mut cfg: Config) -> Result<Config, String> {
-    if cfg.refresh_seconds < 15 {
-        return Err("refresh must be at least 15 seconds".into());
+    validate_refresh(cfg.refresh_seconds)?;
+    if !matches!(cfg.theme.as_str(), "system" | "light" | "dark") {
+        return Err("theme must be system, light or dark".into());
     }
     let blank = |v: &mut Option<String>| {
         *v = v.take().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
@@ -139,7 +156,7 @@ mod tests {
     }
 
     fn cfg(refresh: u64, profiles: Vec<ProfileConfig>) -> Config {
-        Config { refresh_seconds: refresh, profiles }
+        Config { refresh_seconds: refresh, theme: default_theme(), profiles }
     }
 
     #[test]

@@ -24,7 +24,7 @@ Ring colour is based on percent used, per ring:
 
 - Any number of profiles, laid out in a compact grid of 2 rows
 - Transparent, always-on-top and click-through: mouse clicks go to the apps underneath
-- Tray icon menu: **Refresh now**, **Unlock to move** (drag the widget), **Profiles**, **MCP servers**, **Settings**, **Quit**
+- Tray icon menu: **Refresh now**, **Unlock to move** (drag the widget), **Dashboard** (opens the manager), **Run at Windows startup**, **Quit**. Only one widget and one manager run at a time; starting a second widget just flashes the rings of the running one
 - Per-monitor DPI aware; starts bottom-right of the work area
 - Draws its own tray icon at startup (dark disc with an orange and green double ring); if it is hidden, drag it out of the tray overflow
 - Refreshes every 15 minutes by default; the old numbers stay visible while a refresh runs
@@ -49,10 +49,11 @@ Claude Code handles authentication and token refresh itself, so the widget never
 
 ## Configuration
 
-The tray menu opens a local manager in the browser (`127.0.0.1`, random port and token, only while the widget runs) with three pages: **Profiles**, **MCP servers** and **Settings**.
+The tray menu's **Dashboard** opens the native manager window (`claude-usage-manager.exe`, next to the widget), centred on the screen, with four pages: **Home** (dashboard), **Profiles**, **MCP servers** and **Settings**. Starting the manager again while it is open just brings that window forward. The title bar has a **Show rings** button that raises the rings widget (and starts it if it is not running).
 
+- **Home** shows the number of accounts, the highest weekly use, the next weekly reset, a donut of each account's share of the combined weekly usage, and the upcoming reset dates (plus any account whose usage could not be read).
 - **Profiles** lists the profiles shown in the widget with their folder, launcher command and enabled MCP servers. Edit changes the name, launcher command or config folder; Remove only hides a profile in the widget (its files are kept); *Add existing…* shows an existing config folder; *New profile* creates one (see below).
-- **Settings** sets the refresh interval.
+- **Settings** sets the manager theme (System, Light or Dark; System follows the Windows app mode and is the default), the refresh interval, and checks for updates. The interval is saved when you leave the page or close the window. The menu button in the title bar collapses the sidebar to icons.
 
 Saving applies immediately and triggers a refresh.
 
@@ -61,6 +62,7 @@ The settings are stored in `%APPDATA%\claude-usage-widget\config.json`, created 
 ```json
 {
   "refresh_seconds": 900,
+  "theme": "system",
   "profiles": [
     { "name": "main", "command": "claude" }
   ]
@@ -72,6 +74,7 @@ The settings are stored in `%APPDATA%\claude-usage-widget\config.json`, created 
 | `name` | Label shown under the rings |
 | `command` | Launcher command. Its `.cmd`/`.bat` on `PATH` is parsed for `CLAUDE_CONFIG_DIR`; without one, `~/.claude` is used |
 | `config_dir` | Explicit config directory (`~` expanded). Takes priority over `command` |
+| `theme` | Manager window theme: `system` (default), `light` or `dark` |
 | `refresh_seconds` | Poll interval in seconds, default 900 (15 min), minimum 15. "Refresh now" and restarting the app each make an immediate request, so avoid spamming them |
 
 Profile launchers look like this (`claude-work.cmd`):
@@ -90,12 +93,11 @@ Tray menu → **MCP servers** (or the *MCP servers* page of the manager) lets yo
 - Editing or renaming a server updates it in every profile that has it on; deleting removes it from all of them.
 - **Import** copies the servers already in a profile's `.claude.json` into the shared list (names already in the list are skipped). Keys the UI does not edit, such as `tools`, are kept; entries with a type other than `stdio`/`http` are skipped.
 - **New profile** (on the Profiles page) does what `new-claude-profile.bat` does: it creates `%USERPROFILE%\claude-profiles\<name>` with a default `settings.json`, writes the launcher `%USERPROFILE%\.local\bin\<name>.cmd` (sets `CLAUDE_CONFIG_DIR`, runs `claude.exe`), adds the profile to the widget, and turns on the shared MCP servers you tick. Existing folders, `settings.json` and launchers are kept. `claude.exe` is looked up in `CLAUDE_EXE`, `%USERPROFILE%\.local\bin`, then `PATH`; `CLAUDE_PROFILE_ROOT` and `CLAUDE_BIN_DIR` override the folders. Servers that run through `dnx` are plain `stdio` servers with command `dnx`.
-- Every page has a theme icon (system, sun, moon) for **Auto / Light / Dark**; the choice is remembered in the browser.
 - Env values are stored in plain text in both files, as Claude Code does itself. Restart running Claude sessions to pick up changes.
 
 ## Build and run
 
-Requires the Rust MSVC toolchain.
+Requires the Rust MSVC toolchain. The manager window is a WinUI 3 app, so running it needs the [Windows App Runtime](https://learn.microsoft.com/en-us/windows/apps/windows-app-sdk/) (the widget itself works without it).
 
 ```powershell
 cargo build --release
@@ -110,7 +112,7 @@ Tray menu → **Run at Windows startup** (checked when enabled). It adds or remo
 
 ## Updating
 
-Tray menu → **Check for updates**. If a newer GitHub release exists, you are asked to confirm; the app then downloads the zip for your architecture, verifies it against the release's `.sha256` file, closes, replaces its exe and starts the new version. If the download or checksum fails, nothing is changed. It uses the `curl`, `tar` and PowerShell that ship with Windows 10/11.
+Manager → **Settings → Check for updates**. If a newer GitHub release exists, you are asked to confirm; the app then downloads the zip for your architecture, verifies it against the release's `.sha256` file, closes, replaces both exes (widget and manager) and starts the new version. If the download or checksum fails, nothing is changed. It uses the `curl`, `tar` and PowerShell that ship with Windows 10/11.
 
 ## Troubleshooting
 
@@ -123,11 +125,12 @@ Tray menu → **Check for updates**. If a newer GitHub release exists, you are a
 
 ## Project layout
 
-- `src/main.rs` – window, layered rendering, tray menu, polling thread
+- `src/main.rs` – widget: window, layered rendering, tray menu, polling thread
+- `src/bin/claude-usage-manager.rs` – native manager window (Profiles, MCP servers, Settings pages)
+- `src/manager.rs` – the manager's data layer (shared by the UI and its tests), widget hand-off via named event and `usage-cache.json`
+- `src/lib.rs` – modules shared by both executables
 - `src/config.rs` – config file, profile directory resolution
 - `src/update.rs` – check for updates: GitHub release lookup, SHA-256 verify, replace helper
 - `src/usage.rs` – runs `claude -p "/usage"` and parses it
 - `src/profile.rs` – creates a profile (folder, launcher, widget entry)
 - `src/mcp.rs` – central MCP list, sync into profile `.claude.json`
-- `src/web.rs` – localhost server for the manager UI
-- `src/profiles_ui.html`, `src/mcp_ui.html`, `src/settings_ui.html`, `src/ui_common.css`, `src/ui_common.js` – the manager pages and shared styles/helpers

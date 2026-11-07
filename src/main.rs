@@ -1,11 +1,8 @@
 #![windows_subsystem = "windows"]
 
-mod config;
-mod mcp;
-mod profile;
-mod update;
+use claude_usage_widget::manager::{self, Page};
+use claude_usage_widget::config;
 mod usage;
-mod web;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -14,7 +11,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use windows::core::{w, Result, HRESULT, HSTRING};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, WaitForSingleObject, INFINITE};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
@@ -25,22 +24,22 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::Vector2;
 
 const WM_DATA: u32 = WM_APP + 1;
+/// Posted when the manager (or a second launch) asks the rings to show themselves.
+const WM_SHOW: u32 = WM_APP + 3;
+const TIMER_HIGHLIGHT: usize = 1;
 const WM_TRAY: u32 = WM_APP + 2;
 const ID_REFRESH: usize = 1;
-const ID_CONFIG: usize = 2;
 const ID_MOVE: usize = 3;
 const ID_QUIT: usize = 4;
-const ID_MCP: usize = 5;
-const ID_PROFILES: usize = 6;
-const ID_UPDATE: usize = 7;
 const ID_STARTUP: usize = 8;
+const ID_HOME: usize = 9;
 
 const RUN_KEY: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: windows::core::PCWSTR = w!("ClaudeUsageWidget");
@@ -102,8 +101,9 @@ static STATE: Mutex<Vec<ProfileState>> = Mutex::new(Vec::new());
 static REFRESH_TX: OnceLock<Sender<()>> = OnceLock::new();
 /// When unlocked the window catches the mouse so it can be dragged.
 static UNLOCKED: AtomicBool = AtomicBool::new(false);
+/// Brief backdrop flash after "Show rings" so the widget is easy to spot.
+static HIGHLIGHT: AtomicBool = AtomicBool::new(false);
 /// Set while an update check or install is running, so a second click is ignored.
-static UPDATING: AtomicBool = AtomicBool::new(false);
 /// Tray icon handle, drawn at startup.
 static TRAY_ICON: AtomicIsize = AtomicIsize::new(0);
 
@@ -128,13 +128,8 @@ fn rgba(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
 
 /// Colour by percent used: red above 90%, orange above 60%, otherwise green.
 fn level_color(used: f32) -> D2D1_COLOR_F {
-    if used > 90.0 {
-        rgba(0.92, 0.33, 0.33, 1.0)
-    } else if used > 60.0 {
-        rgba(0.98, 0.58, 0.16, 1.0)
-    } else {
-        rgba(0.30, 0.78, 0.45, 1.0)
-    }
+    let (r, g, b) = manager::level_rgb(used);
+    rgba(r, g, b, 1.0)
 }
 
 fn make_format(dw: &IDWriteFactory, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
@@ -286,8 +281,9 @@ impl App {
             self.rt.BeginDraw();
             self.rt.Clear(Some(&rgba(0.0, 0.0, 0.0, 0.0)));
 
-            // While unlocked, show a light backdrop so the window is visible and draggable.
-            if UNLOCKED.load(Ordering::Relaxed) {
+            // While unlocked (or briefly after "Show rings"), show a light backdrop so the window is
+            // visible; unlocked also makes it draggable.
+            if UNLOCKED.load(Ordering::Relaxed) || HIGHLIGHT.load(Ordering::Relaxed) {
                 let rr = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F { left: 0.5, top: 0.5, right: w as f32 / scale - 0.5, bottom: h as f32 / scale - 0.5 },
                     radiusX: 8.0,
@@ -525,54 +521,62 @@ fn set_click_through(hwnd: HWND, through: bool) {
     }
 }
 
-/// Opens one page of the local manager UI in the default browser.
-fn open_page(page: &str) {
-    if let Some(url) = web::url(page) {
-        unsafe {
-            ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
-        }
+/// Starts the manager window (a separate executable next to this one) on the given page.
+fn launch_manager(page: Page) {
+    let exe = std::env::current_exe().ok().map(|p| p.with_file_name("claude-usage-manager.exe"));
+    let ok = exe
+        .filter(|p| p.exists())
+        .map(|p| std::process::Command::new(p).arg("--page").arg(page.arg()).spawn().is_ok())
+        .unwrap_or(false);
+    if !ok {
+        message(
+            "Cannot start the manager (claude-usage-manager.exe not found next to the widget).",
+            MB_OK | MB_ICONWARNING,
+        );
     }
+}
+
+/// Forwards the manager's "something changed" event to the worker as a refresh request.
+/// Turns the "show rings" event (from the manager or a second launch) into a WM_SHOW message.
+fn spawn_show_listener(hwnd: isize) {
+    std::thread::spawn(move || unsafe {
+        let Ok(ev) = CreateEventW(None, false, false, manager::show_event_name()) else { return };
+        while WaitForSingleObject(ev, INFINITE) == WAIT_OBJECT_0 {
+            let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_SHOW, WPARAM(0), LPARAM(0));
+        }
+    });
+}
+
+fn spawn_refresh_listener() {
+    std::thread::spawn(|| unsafe {
+        let Ok(ev) = CreateEventW(None, false, false, manager::refresh_event_name()) else { return };
+        while WaitForSingleObject(ev, INFINITE) == WAIT_OBJECT_0 {
+            if let Some(tx) = REFRESH_TX.get() {
+                let _ = tx.send(());
+            }
+        }
+    });
+}
+
+/// Mirrors STATE into usage-cache.json for the manager process.
+fn write_usage_cache() {
+    let entries: Vec<manager::UsageEntry> = STATE
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| manager::UsageEntry {
+            name: s.name.clone(),
+            session_used: s.session_used,
+            weekly_used: s.weekly_used,
+            weekly_reset: s.weekly_reset.clone(),
+            error: s.error.clone(),
+        })
+        .collect();
+    let _ = manager::write_usage(&entries);
 }
 
 fn message(text: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
     unsafe { MessageBoxW(None, &HSTRING::from(text), w!("Usage Rings for Claude Code"), flags | MB_TOPMOST) }
-}
-
-/// Checks GitHub for a newer release and, if the user agrees, installs it and restarts.
-fn check_for_updates(hwnd: HWND) {
-    if UPDATING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let hwnd = hwnd.0 as isize;
-    std::thread::spawn(move || {
-        let current = env!("CARGO_PKG_VERSION");
-        let outcome = (|| -> std::result::Result<bool, String> {
-            let release = update::fetch_latest()?;
-            if !update::is_newer(&release.tag, current) {
-                message(&format!("You're up to date (v{current})."), MB_OK | MB_ICONINFORMATION);
-                return Ok(false);
-            }
-            let ask = format!("Update to {}? The app will restart.", release.tag);
-            if message(&ask, MB_YESNO | MB_ICONQUESTION) != IDYES {
-                return Ok(false);
-            }
-            let ready = update::download_and_verify(&release)?;
-            update::start_replace_helper(&ready)?;
-            Ok(true)
-        })();
-        match outcome {
-            Ok(true) => unsafe {
-                // Exit so the helper can swap the exe; it relaunches the new one.
-                let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0));
-                return;
-            },
-            Ok(false) => {}
-            Err(e) => {
-                message(&format!("Update failed: {e}"), MB_OK | MB_ICONERROR);
-            }
-        }
-        UPDATING.store(false, Ordering::SeqCst);
-    });
 }
 
 fn show_menu(hwnd: HWND) {
@@ -586,9 +590,7 @@ fn show_menu(hwnd: HWND) {
             ID_MOVE,
             w!("Unlock to move"),
         );
-        let _ = AppendMenuW(menu, MF_STRING, ID_PROFILES, w!("Profiles"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_MCP, w!("MCP servers"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_CONFIG, w!("Settings"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_HOME, w!("Dashboard"));
         let startup = startup_enabled();
         let _ = AppendMenuW(
             menu,
@@ -596,7 +598,6 @@ fn show_menu(hwnd: HWND) {
             ID_STARTUP,
             w!("Run at Windows startup"),
         );
-        let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, w!("Check for updates"));
         let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, w!("Quit"));
 
         let mut pt = POINT::default();
@@ -618,11 +619,8 @@ fn show_menu(hwnd: HWND) {
                 set_click_through(hwnd, !now);
                 repaint(hwnd);
             }
-            ID_PROFILES => open_page("/profiles"),
-            ID_MCP => open_page("/mcp"),
-            ID_CONFIG => open_page("/settings"),
+            ID_HOME => launch_manager(Page::Home),
             ID_STARTUP => set_startup(!startup),
-            ID_UPDATE => check_for_updates(hwnd),
             ID_QUIT => {
                 let _ = DestroyWindow(hwnd);
             }
@@ -639,6 +637,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else {
                 LRESULT(HTTRANSPARENT as isize)
             }
+        }
+        WM_SHOW => {
+            // Raise without taking focus, flash the backdrop, and fetch fresh numbers.
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            HIGHLIGHT.store(true, Ordering::Relaxed);
+            repaint(hwnd);
+            SetTimer(Some(hwnd), TIMER_HIGHLIGHT, 2000, None);
+            if let Some(tx) = REFRESH_TX.get() {
+                let _ = tx.send(());
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TIMER_HIGHLIGHT => {
+            let _ = KillTimer(Some(hwnd), TIMER_HIGHLIGHT);
+            HIGHLIGHT.store(false, Ordering::Relaxed);
+            repaint(hwnd);
+            LRESULT(0)
         }
         WM_DATA => {
             repaint(hwnd);
@@ -715,6 +731,7 @@ fn spawn_worker(hwnd: isize, rx: mpsc::Receiver<()>) {
                         }
                     }
                     drop(st);
+                    write_usage_cache();
                     notify(hwnd);
                 })
             })
@@ -738,6 +755,12 @@ fn notify(hwnd: isize) {
 
 fn main() -> Result<()> {
     unsafe {
+        // One widget at a time: a second launch just asks the running one to show itself.
+        let _instance = CreateMutexW(None, true, w!("Local\\ClaudeUsageWidgetInstance"));
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = manager::show_widget();
+            return Ok(());
+        }
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst = GetModuleHandleW(None)?;
         let class = w!("ClaudeUsageWidget");
@@ -793,6 +816,8 @@ fn main() -> Result<()> {
 
         let (tx, rx) = mpsc::channel();
         let _ = REFRESH_TX.set(tx);
+        spawn_refresh_listener();
+        spawn_show_listener(hwnd.0 as isize);
         spawn_worker(hwnd.0 as isize, rx);
 
         let mut msg = MSG::default();
